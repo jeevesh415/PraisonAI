@@ -26,7 +26,7 @@ AGENTOPS_AVAILABLE = False
 PRAISONAI_AVAILABLE = False
 
 try:
-    from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, Agents
+    from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam
     PRAISONAI_AVAILABLE = True
 except ImportError:
     pass
@@ -55,6 +55,16 @@ try:
 except ImportError:
     pass
 
+AG2_AVAILABLE = False
+try:
+    import importlib.metadata as _importlib_metadata
+    _importlib_metadata.distribution('ag2')
+    from autogen import LLMConfig as _AG2LLMConfig  # noqa: F401 — AG2-exclusive class
+    AG2_AVAILABLE = True
+    del _AG2LLMConfig, _importlib_metadata
+except Exception:
+    pass
+
 try:
     import agentops
     AGENTOPS_AVAILABLE = True
@@ -65,7 +75,7 @@ except ImportError:
     pass
 
 # Only try to import praisonai_tools if either CrewAI or AutoGen is available
-if CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE:
+if CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE or AG2_AVAILABLE:
     try:
         from praisonai_tools import (
             CodeDocsSearchTool, CSVSearchTool, DirectorySearchTool, DOCXSearchTool, DirectoryReadTool,
@@ -170,7 +180,7 @@ if CREWAI_AVAILABLE:
     disable_crewai_telemetry()
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -183,6 +193,7 @@ class AgentsGenerator:
             task_callback (callable, optional): A callback function to be executed after each tool run.
             agent_yaml (str, optional): The content of the YAML file. Defaults to None.
             tools (dict, optional): A dictionary containing the tools to be used for the agents. Defaults to None.
+            cli_config (dict, optional): CLI configuration to override YAML settings. Defaults to None.
 
         Attributes:
             agent_file (str): The path to the agent file.
@@ -201,6 +212,7 @@ class AgentsGenerator:
         self.task_callback = task_callback
         self.agent_yaml = agent_yaml
         self.tools = tools or []  # Store tool class names as a list
+        self.cli_config = cli_config or {}  # Store CLI configuration overrides
         self.log_level = log_level or logging.getLogger().getEffectiveLevel()
         if self.log_level == logging.NOTSET:
             self.log_level = os.environ.get('LOGLEVEL', 'INFO').upper()
@@ -216,6 +228,73 @@ class AgentsGenerator:
             raise ImportError("AutoGen is not installed. Please install it with 'pip install praisonai[autogen]' for v0.2 or 'pip install praisonai[autogen-v4]' for v0.4")
         elif framework == "praisonai" and not PRAISONAI_AVAILABLE:
             raise ImportError("PraisonAI is not installed. Please install it with 'pip install praisonaiagents'")
+        elif framework == "ag2" and not AG2_AVAILABLE:
+            raise ImportError("AG2 is not installed. Please install it with 'pip install praisonai[ag2]'")
+
+    def _merge_cli_config(self, config, cli_config):
+        """
+        Merge CLI configuration with YAML configuration.
+        
+        CLI configuration takes precedence over YAML configuration for:
+        - Global config fields (acp, lsp) -> config.config
+        - Agent-level fields (trust, tool_timeout, planning_tools, autonomy, guardrail, approval) -> applied to all agents
+        
+        Args:
+            config (dict): The parsed YAML configuration
+            cli_config (dict): The CLI configuration to merge
+        """
+        self.logger.debug(f"Merging CLI config: {cli_config}")
+        
+        # Handle global config overrides (acp, lsp)
+        if 'acp' in cli_config or 'lsp' in cli_config:
+            if 'config' not in config:
+                config['config'] = {}
+            
+            if 'acp' in cli_config:
+                config['config']['acp'] = cli_config['acp']
+                self.logger.debug(f"CLI override: acp = {cli_config['acp']}")
+            
+            if 'lsp' in cli_config:
+                config['config']['lsp'] = cli_config['lsp'] 
+                self.logger.debug(f"CLI override: lsp = {cli_config['lsp']}")
+        
+        # Handle agent-level overrides (trust, tool_timeout, planning_tools, autonomy, guardrail, approval)
+        agent_level_fields = ['trust', 'tool_timeout', 'planning_tools', 'autonomy', 'guardrail', 'approval', 'approve_all_tools', 'approval_timeout']
+        agent_overrides = {k: v for k, v in cli_config.items() if k in agent_level_fields}
+        
+        # Map CLI field names to YAML field names
+        field_mappings = {
+            'guardrail': 'guardrails',  # CLI uses --guardrail, YAML uses guardrails
+            'trust': 'approval'  # --trust maps to approval=True
+        }
+        
+        # Apply field mappings and special handling
+        for cli_field in field_mappings:
+            if cli_field in agent_overrides:
+                value = agent_overrides.pop(cli_field)
+                if cli_field == 'trust' and value:
+                    # --trust flag maps to approval=True for auto-approval
+                    agent_overrides['approval'] = True
+                elif cli_field == 'guardrail':
+                    # --guardrail "description" maps to guardrails config
+                    agent_overrides['guardrails'] = value
+        
+        if agent_overrides:
+            # Apply to all agents in the config
+            roles = config.get('roles', {})
+            agents = config.get('agents', {})
+            
+            # Apply to 'roles' section (canonical format)
+            for role_name, role_config in roles.items():
+                for field, value in agent_overrides.items():
+                    role_config[field] = value
+                    self.logger.debug(f"CLI override for role {role_name}: {field} = {value}")
+            
+            # Apply to 'agents' section (backward compatibility)
+            for agent_name, agent_config in agents.items():
+                for field, value in agent_overrides.items():
+                    agent_config[field] = value
+                    self.logger.debug(f"CLI override for agent {agent_name}: {field} = {value}")
 
     def is_function_or_decorated(self, obj):
         """
@@ -359,6 +438,11 @@ class AgentsGenerator:
                 print(f"File not found: {self.agent_file}")
                 return
 
+        # Apply CLI configuration overrides to YAML config
+        if self.cli_config:
+            # Merge CLI configuration with YAML config
+            self._merge_cli_config(config, self.cli_config)
+
         # Check if this is a workflow-mode YAML (process: workflow or has steps section)
         process_type = config.get('process', 'sequential')
         has_steps = 'steps' in config
@@ -375,8 +459,9 @@ class AgentsGenerator:
             for agent_name, agent_config in config['agents'].items():
                 role_config = dict(agent_config) if agent_config else {}
                 # Convert 'instructions' to 'backstory' if present
+                # Note: preserve 'instructions' key so _run_praisonai can pass it to PraisonAgent
                 if 'instructions' in role_config and 'backstory' not in role_config:
-                    role_config['backstory'] = role_config.pop('instructions')
+                    role_config['backstory'] = role_config['instructions']
                 # Ensure required fields have defaults
                 if 'role' not in role_config:
                     role_config['role'] = agent_name.replace('_', ' ').title()
@@ -391,7 +476,7 @@ class AgentsGenerator:
         tools_dict = {}
         
         # Only try to use praisonai_tools if it's available and needed
-        if PRAISONAI_TOOLS_AVAILABLE and (CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE):
+        if PRAISONAI_TOOLS_AVAILABLE and (CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE or AG2_AVAILABLE):
             tools_dict = {
                 'CodeDocsSearchTool': CodeDocsSearchTool(),
                 'CSVSearchTool': CSVSearchTool(),
@@ -462,6 +547,12 @@ class AgentsGenerator:
             else:
                 self.logger.info("Using AutoGen v0.2")
                 return self._run_autogen(config, topic, tools_dict)
+        elif framework == "ag2":
+            if not AG2_AVAILABLE:
+                raise ImportError("AG2 is not installed. Please install it with 'pip install praisonai[ag2]'")
+            if AGENTOPS_AVAILABLE:
+                agentops.init(os.environ.get("AGENTOPS_API_KEY"), default_tags=["ag2"])
+            return self._run_ag2(config, topic, tools_dict)
         elif framework == "praisonai":
             if not PRAISONAI_AVAILABLE:
                 raise ImportError("PraisonAI is not installed. Please install it with 'pip install praisonaiagents'")
@@ -711,6 +802,148 @@ class AgentsGenerator:
             self.logger.error(f"Error running AutoGen v0.4: {str(e)}")
             return f"### AutoGen v0.4 Error ###\n{str(e)}"
 
+    def _run_ag2(self, config, topic, tools_dict):
+        """
+        Run agents using the AG2 framework (community fork of AutoGen, PyPI: ag2).
+
+        AG2 installs under the 'autogen' namespace — there is no 'import ag2'.
+        Uses LLMConfig context manager + AssistantAgent + GroupChat pattern.
+
+        Args:
+            config (dict): Configuration dictionary parsed from YAML
+            topic (str): The topic/task to process
+            tools_dict (dict): Dictionary of available tools
+
+        Returns:
+            str: Result prefixed with '### AG2 Output ###'
+        """
+        import re as _re
+        from autogen import (
+            AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager, LLMConfig
+        )
+
+        model_config = self.config_list[0] if self.config_list else {}
+
+        # Allow YAML top-level llm block to override config_list values
+        yaml_llm = config.get("llm", {}) or {}
+        # Also check first role's llm block as a fallback
+        first_role_llm = {}
+        for role_details in config.get("roles", {}).values():
+            first_role_llm = role_details.get("llm", {}) or {}
+            break
+
+        # Priority: YAML top-level llm > first role llm > config_list > env vars
+        def _resolve(key, env_var=None, default=None):
+            return (yaml_llm.get(key) or first_role_llm.get(key)
+                    or model_config.get(key)
+                    or (os.environ.get(env_var) if env_var else None)
+                    or default)
+
+        api_type = _resolve("api_type", default="openai").lower()
+        model_name = _resolve("model", default="gpt-4o-mini")
+        api_key = _resolve("api_key", env_var="OPENAI_API_KEY")
+        base_url = (model_config.get("base_url")
+                    or yaml_llm.get("base_url")
+                    or os.environ.get("OPENAI_BASE_URL")
+                    or os.environ.get("OPENAI_API_BASE"))
+
+        # Build LLMConfig — Bedrock needs no api_key
+        if api_type == "bedrock":
+            llm_config_entry = {"api_type": "bedrock", "model": model_name}
+        else:
+            llm_config_entry = {"model": model_name}
+            if api_key:
+                llm_config_entry["api_key"] = api_key
+            if base_url and base_url not in ("https://api.openai.com/v1", "https://api.openai.com/v1/"):
+                llm_config_entry["base_url"] = base_url
+        llm_config = LLMConfig(llm_config_entry)
+
+        user_proxy = UserProxyAgent(
+            name="User",
+            human_input_mode="NEVER",
+            is_termination_msg=lambda x: "TERMINATE" in (x.get("content") or ""),
+            code_execution_config=False,
+        )
+
+        # Create one AssistantAgent per role
+        ag2_agent_entries = []
+        for role, details in config["roles"].items():
+            agent_name = details.get("role", role).replace("{topic}", topic)
+            backstory = details.get("backstory", "").replace("{topic}", topic)
+            agent_name_safe = _re.sub(r"[^a-zA-Z0-9_\-]", "_", agent_name)
+            assistant = AssistantAgent(
+                name=agent_name_safe,
+                system_message=backstory + "\nWhen the task is done, reply 'TERMINATE'.",
+                llm_config=llm_config,
+            )
+            ag2_agent_entries.append((role, details, assistant))
+
+        # Register tools via AG2 decorator pattern
+        for role, details, assistant in ag2_agent_entries:
+            for tool_name in details.get("tools", []):
+                tool = tools_dict.get(tool_name)
+                if tool is None:
+                    continue
+                func = tool if callable(tool) else getattr(tool, "run", None)
+                if func is None:
+                    continue
+
+                def make_tool_fn(f):
+                    def tool_fn(**kwargs):
+                        return f(**kwargs) if callable(f) else str(f)
+                    tool_fn.__name__ = tool_name
+                    return tool_fn
+
+                wrapped = make_tool_fn(func)
+                assistant.register_for_llm(description=f"Tool: {tool_name}")(wrapped)
+                user_proxy.register_for_execution()(wrapped)
+
+        all_assistants = [a for _, _, a in ag2_agent_entries]
+        if not all_assistants:
+            return "### AG2 Output ###\nNo agents created from configuration."
+
+        # Build initial message from all task descriptions
+        task_lines = []
+        for role, details, _ in ag2_agent_entries:
+            for task_name, task_details in details.get("tasks", {}).items():
+                desc = task_details.get("description", "").replace("{topic}", topic)
+                if desc:
+                    task_lines.append(desc)
+        initial_message = "\n".join(task_lines) if task_lines else topic
+
+        groupchat = GroupChat(
+            agents=[user_proxy] + all_assistants,
+            messages=[],
+            max_round=12,
+        )
+        manager = GroupChatManager(groupchat=groupchat, llm_config=llm_config)
+
+        try:
+            chat_result = user_proxy.initiate_chat(manager, message=initial_message)
+        except Exception as e:
+            return f"### AG2 Error ###\n{str(e)}"
+
+        # Prefer ChatResult.summary if available, otherwise scan messages
+        result_content = ""
+        summary = getattr(chat_result, "summary", None)
+        if summary and isinstance(summary, str) and summary.strip():
+            result_content = _re.sub(r'[\s\.\,]*TERMINATE[\s\.\,]*$', '', summary, flags=_re.IGNORECASE).strip().rstrip('.')
+
+        if not result_content:
+            for msg in reversed(groupchat.messages):
+                if msg.get("name") == "User":
+                    continue
+                content = (msg.get("content") or "").strip()
+                if content:
+                    result_content = _re.sub(r'[\s\.\,]*TERMINATE[\s\.\,]*$', '', content, flags=_re.IGNORECASE).strip().rstrip('.')
+                    if result_content:
+                        break
+
+        if not result_content:
+            result_content = "Task completed."
+
+        return f"### AG2 Output ###\n{result_content}"
+
     def _run_crewai(self, config, topic, tools_dict):
         """
         Run agents using the CrewAI framework.
@@ -866,6 +1099,48 @@ class AgentsGenerator:
         tools_list = self.load_tools_from_tools_py()
         self.logger.debug(f"Loaded tools from tools.py: {tools_list}")
 
+        # Initialize InteractiveRuntime for ACP/LSP if enabled globally
+        global_config = config.get('config', {})
+        acp_enabled = global_config.get('acp', False)
+        lsp_enabled = global_config.get('lsp', False)
+        interactive_runtime = None
+        interactive_loop = None
+        
+        if acp_enabled or lsp_enabled:
+            try:
+                import asyncio
+                import os
+                from praisonai.cli.features.interactive_runtime import InteractiveRuntime, RuntimeConfig
+                from praisonai.cli.features.agent_tools import create_agent_centric_tools
+                import nest_asyncio
+                
+                nest_asyncio.apply()
+                runtime_config = RuntimeConfig(
+                    workspace=os.getcwd(),
+                    acp_enabled=acp_enabled,
+                    lsp_enabled=lsp_enabled,
+                    approval_mode=os.environ.get("PRAISONAI_APPROVAL_MODE", "prompt")
+                )
+                interactive_runtime = InteractiveRuntime(runtime_config)
+                self.logger.info(f"Starting InteractiveRuntime (ACP: {acp_enabled}, LSP: {lsp_enabled})")
+                
+                try:
+                    interactive_loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    interactive_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(interactive_loop)
+                
+                interactive_loop.run_until_complete(interactive_runtime.start())
+                
+                centric_tools = create_agent_centric_tools(interactive_runtime)
+                self.logger.info(f"Injected {len(centric_tools)} InteractiveRuntime tools globally")
+                tools_list.extend(centric_tools)
+                
+            except ImportError as e:
+                self.logger.warning(f"Failed to load InteractiveRuntime components: {e}")
+            except Exception as e:
+                self.logger.error(f"Error starting InteractiveRuntime: {e}")
+
         # Create agents from config
         for role, details in config['roles'].items():
             role_filled = safe_format(details['role'], topic=topic)
@@ -903,6 +1178,98 @@ class AgentsGenerator:
             llm_model = llm_config.get("model") if isinstance(llm_config, dict) else llm_config
             llm_model = llm_model or os.environ.get("MODEL_NAME") or "gpt-4o-mini"
             
+            # Extract YAML configuration for new CLI parity features
+            agent_tool_timeout = details.get('tool_timeout', None)
+            
+            agent_planning_tools = details.get('planning_tools', None)
+            agent_planning = details.get('planning', False)
+            if agent_planning_tools is not None:
+                if isinstance(agent_planning, dict):
+                    agent_planning['tools'] = agent_planning_tools
+                elif not agent_planning:
+                    agent_planning = {'tools': agent_planning_tools}
+            
+            # Clean up user YAML if they nested 'planning_tools' inside 'planning'
+            if isinstance(agent_planning, dict) and 'planning_tools' in agent_planning:
+                if 'tools' not in agent_planning:
+                    agent_planning['tools'] = agent_planning.pop('planning_tools')
+                else:
+                    agent_planning.pop('planning_tools')
+            
+            # Extract YAML configuration for advanced features
+            autonomy_config = details.get('autonomy')
+            guardrails_config = details.get('guardrails')
+            
+            # Extract streaming configuration - YAML takes precedence over CLI
+            has_streaming_config = 'streaming' in details
+            has_legacy_stream = 'stream' in details
+            streaming_config = details.get('streaming')
+            stream_enabled = False
+            stream_metrics = False
+            
+            if has_streaming_config:
+                if isinstance(streaming_config, bool):
+                    stream_enabled = streaming_config
+                elif isinstance(streaming_config, dict):
+                    stream_enabled = streaming_config.get('enabled', False)
+                    stream_metrics = streaming_config.get('emit_metrics', False)
+                    # Future: can add callbacks, etc. from streaming_config
+            elif has_legacy_stream:  # Also support direct 'stream: true' format
+                stream_enabled = details.get('stream', False)
+            
+            # CLI streaming flags override if YAML doesn't specify
+            cli_config = getattr(self, 'cli_config', {}) or {}
+            if not has_streaming_config and not has_legacy_stream:
+                stream_enabled = cli_config.get('stream', False)
+                stream_metrics = cli_config.get('stream_metrics', False)
+            
+            # Reconstruct approval config from potentially scattered settings
+            approval_val = details.get('approval')
+            approve_all = details.get('approve_all_tools')
+            approval_timeout = details.get('approval_timeout')
+            
+            approval_config = None
+            if approval_val is not None or approve_all is not None or approval_timeout is not None:
+                if isinstance(approval_val, dict):
+                    approval_dict = approval_val
+                else:
+                    approval_dict = {'backend': approval_val}
+                
+                if approve_all is not None:
+                    approval_dict['approve_all_tools'] = approve_all
+                if approval_timeout is not None:
+                    approval_dict['approval_timeout'] = approval_timeout
+                
+                try:
+                    from .cli.features.approval import resolve_approval_config
+                    # Map common YAML fields to resolve_approval_config parameters
+                    approval_config = resolve_approval_config(
+                        backend_name=approval_dict.get('backend') or approval_dict.get('backend_name'),
+                        all_tools=approval_dict.get('approve_all_tools') or approval_dict.get('all_tools', False),
+                        timeout=approval_dict.get('approval_timeout') or approval_dict.get('timeout')
+                    )
+                except ImportError:
+                    # Fallback: Create ApprovalConfig directly if resolve_approval_config isn't available
+                    try:
+                        from praisonaiagents.approval.protocols import ApprovalConfig
+                        approval_config = ApprovalConfig(
+                            backend=approval_dict.get('backend', None),
+                            all_tools=approval_dict.get('approve_all_tools', approval_dict.get('all_tools', False)),
+                            timeout=approval_dict.get('approval_timeout', approval_dict.get('timeout', 0))
+                        )
+                    except ImportError:
+                        # Last resort: disable approval for this agent
+                        approval_config = None
+            
+            # Build output configuration with streaming support
+            output_config = None
+            if stream_enabled:
+                try:
+                    from praisonaiagents.config import OutputConfig
+                    output_config = OutputConfig(stream=True, metrics=stream_metrics)
+                except ImportError:
+                    self.logger.warning("OutputConfig not available, streaming disabled")
+            
             agent = PraisonAgent(
                 name=role_filled,
                 role=role_filled,
@@ -913,6 +1280,12 @@ class AgentsGenerator:
                 allow_delegation=details.get('allow_delegation', False),
                 llm=llm_model,
                 reflection=details.get('reflection', False),
+                tool_timeout=agent_tool_timeout,
+                planning=agent_planning,
+                autonomy=autonomy_config,
+                guardrails=guardrails_config,
+                approval=approval_config,
+                output=output_config,
             )
             
             if self.agent_callback:
@@ -974,7 +1347,9 @@ class AgentsGenerator:
 
         # Create and run the PraisonAI agents
         memory = config.get('memory', False)
+        
         self.logger.debug(f"Memory: {memory}")
+        
         if config.get('process') == 'hierarchical':
             agents = AgentTeam(
                 agents=list(agents.values()),
@@ -994,9 +1369,17 @@ class AgentsGenerator:
         self.logger.debug(f"Agents: {agents.agents}")
         self.logger.debug(f"Tasks: {agents.tasks}")
 
-        response = agents.start()
-        self.logger.debug(f"Result: {response}")
-        result = ""
+        try:
+            response = agents.start()
+            self.logger.debug(f"Result: {response}")
+            result = response if response else ""
+        finally:
+            if interactive_runtime and interactive_loop:
+                try:
+                    self.logger.info("Stopping InteractiveRuntime...")
+                    interactive_loop.run_until_complete(interactive_runtime.stop())
+                except Exception as e:
+                    self.logger.error(f"Error stopping InteractiveRuntime: {e}")
         
         if AGENTOPS_AVAILABLE:
             agentops.end_session("Success")

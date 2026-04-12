@@ -10,12 +10,12 @@ that was duplicated across multiple evaluators.
 
 import os
 import logging
+from praisonaiagents._logging import get_logger
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class GradeResult:
@@ -57,7 +57,6 @@ class GradeResult:
             expected_output=data.get("expected_output"),
             timestamp=data.get("timestamp", datetime.utcnow().isoformat()),
         )
-
 
 class BaseLLMGrader:
     """
@@ -249,6 +248,38 @@ EXPECTED OUTPUT (ideal response):
                 "Install with: pip install litellm"
             )
     
+    def _make_llm_call(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Make an LLM call with chat-style messages.
+        
+        This method is used by subclasses like ComparisonGrader and SafetyGrader
+        that need to send messages in chat format.
+        
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            
+        Returns:
+            The LLM response text
+            
+        Raises:
+            Exception: If the LLM call fails
+        """
+        litellm = self._get_litellm()
+        
+        try:
+            response = litellm.completion(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+            
+            return response.choices[0].message.content or ""
+            
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            raise
+    
     def grade(
         self,
         input_text: str,
@@ -335,7 +366,6 @@ EXPECTED OUTPUT (ideal response):
                 expected_output=expected_output,
             )
 
-
 def parse_score_reasoning(response_text: str) -> tuple:
     """
     Parse SCORE and REASONING from LLM response.
@@ -369,7 +399,6 @@ def parse_score_reasoning(response_text: str) -> tuple:
             reasoning = line.replace('REASONING:', '').strip()
     
     return score, reasoning
-
 
 __all__ = [
     'GradeResult',

@@ -22,13 +22,14 @@ Storage Structure:
 import os
 import re
 import logging
+from praisonaiagents._logging import get_logger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass, field
 from ..task.task import Task
+from ..workflows.results import StepResult, StepError, WorkflowResult, StepStatus, ErrorStrategy
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class WorkflowContext:
@@ -48,7 +49,6 @@ class StepResult:
 # Aliases for backward compatibility
 StepInput = WorkflowContext
 StepOutput = StepResult
-
 
 # =============================================================================
 # Workflow Pattern Helpers
@@ -76,7 +76,6 @@ class Route:
         self.routes = routes
         self.default = default or routes.get("default", [])
 
-
 @dataclass  
 class Parallel:
     """
@@ -92,7 +91,6 @@ class Parallel:
     
     def __init__(self, steps: List):
         self.steps = steps
-
 
 @dataclass
 class Loop:
@@ -131,7 +129,6 @@ class Loop:
         self.from_file = from_file
         self.var_name = var_name
 
-
 @dataclass
 class Repeat:
     """
@@ -160,7 +157,6 @@ class Repeat:
         self.until = until
         self.max_iterations = max_iterations
 
-
 # Convenience functions for cleaner API
 def route(routes: Dict[str, List], default: Optional[List] = None) -> Route:
     """Create a routing decision point."""
@@ -179,7 +175,6 @@ def repeat(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None,
            max_iterations: int = 10) -> Repeat:
     """Repeat step until condition is met."""
     return Repeat(step=step, until=until, max_iterations=max_iterations)
-
 
 
 
@@ -719,10 +714,8 @@ class Workflow:
         """Alias for run() for consistency with Agents."""
         return self.run(input, **kwargs)
 
-
 # Alias: Pipeline = Workflow (they are the same concept)
 Pipeline = Workflow
-
 
 class WorkflowManager:
     """
@@ -1972,7 +1965,6 @@ class WorkflowManager:
             self._log(f"Deleted checkpoint '{name}'")
             return True
         return False
-
 
 def create_workflow_manager(
     workspace_path: Optional[str] = None,

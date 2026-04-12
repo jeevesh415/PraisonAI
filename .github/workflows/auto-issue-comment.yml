@@ -1,26 +1,46 @@
-name: Auto Issue Comment with PR Creation
+name: Auto Issue Comment
 
 on:
-  issues:
-    types: [opened]
+  workflow_dispatch:
+#   issues:
+#     types: [opened]
 
 jobs:
-  add-comment:
+  # Trigger Claude by adding the 'claude' label (only if not already labeled)
+  # Note: @claude in comments only works from human users (not bots)
+  # The claude.yml workflow listens for issues:labeled event with 'claude' label
+  trigger-claude:
+    # Skip if issue was already created with 'claude' label to avoid double-trigger
+    if: |
+      !contains(toJSON(github.event.issue.labels), 'claude')
     runs-on: ubuntu-latest
     permissions:
       issues: write
-      contents: write
-      pull-requests: write
-      actions: read
     steps:
-      - name: Add automated comment
+      - name: Add claude label to trigger analysis
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GH_TOKEN }}
           script: |
-            github.rest.issues.createComment({
+            // Check if 'claude' label already exists on this issue
+            const labels = context.payload.issue.labels.map(l => l.name);
+            if (labels.includes('claude')) {
+              console.log('Issue already has claude label, skipping');
+              return;
+            }
+
+            // Add label to trigger claude.yml via issues:labeled event
+            await github.rest.issues.addLabels({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '@claude review this issue and do a detailed analysis and fix this if the existing code doesn\'t have the solution implemented. Making sure it has backward compatibility, no existing features removed. After making those changes, again review the applied changes. Use @web to search if you dont know any information or to find the latest documentation or to find the latest version. Run the code if you think you need to run it to test it. Minimal code change to start with if required any changes. MAINLY IT SHOULD NOT IMPACT ON THE CURRENT SPEED OF EXECUTION of existing features, not increasing the overhead. **Please create a PR using gh tool with your changes**.'
-            })
+              labels: ['claude']
+            });
+
+            // Also post instructions as a comment for context
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🤖 Auto-triaging with Claude. Analyzing issue and implementing a fix...\n\nClaude will:\n1. Classify this issue\n2. Search codebase for root cause\n3. Implement a minimal fix following AGENTS.md\n4. Create a PR with the changes'
+            });

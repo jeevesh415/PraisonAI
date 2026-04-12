@@ -39,17 +39,20 @@ class FileTools:
         if filepath.startswith('~'):
             filepath = os.path.expanduser(filepath)
         
-        # Normalize the path
-        normalized = os.path.normpath(filepath)
-        absolute = os.path.abspath(normalized)
-        
-        # Check for path traversal attempts (.. after normalization)
+        # Check for path traversal attempts BEFORE normalization
         # We check the original input for '..' to catch traversal attempts
-        if '..' in normalized:
+        if '..' in filepath:
             raise ValueError(f"Path traversal detected: {filepath}")
         
-        # Additional check: ensure the resolved path doesn't escape expected boundaries
-        # This is a basic check - in production, you'd want to define allowed directories
+        # Normalize the path and securely resolve symlinks
+        normalized = os.path.normpath(filepath)
+        absolute = os.path.realpath(normalized)
+        
+        # Prevent path traversal outside current workspace / allowed directories
+        cwd = os.path.abspath(os.getcwd())
+        if os.path.commonpath([absolute, cwd]) != cwd:
+            raise ValueError(f"Path traversal detected: {filepath} escapes workspace {cwd}")
+        
         return absolute
     
     @staticmethod
@@ -289,11 +292,45 @@ class FileTools:
             # Validate destination path
             safe_path = FileTools._validate_path(destination)
             
+            # Validate URL to prevent SSRF
+            from urllib.parse import urlparse
+            import ipaddress
+            import socket
+            
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return {
+                    "success": False, "path": "", "size": 0,
+                    "error": f"Unsupported URL scheme: {parsed.scheme}. Only http/https allowed."
+                }
+            
+            hostname = parsed.hostname or ""
+            # Resolve hostname and check for private/reserved IPs
+            try:
+                resolved = socket.getaddrinfo(hostname, parsed.port or 443)
+                for family, _, _, _, sockaddr in resolved:
+                    addr = ipaddress.ip_address(sockaddr[0])
+                    if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+                        return {
+                            "success": False, "path": "", "size": 0,
+                            "error": f"Access to private/internal addresses is blocked: {hostname}"
+                        }
+            except (socket.gaierror, ValueError):
+                pass  # Let httpx handle DNS failures naturally
+            
+            # Block cloud metadata endpoints
+            _blocked_hosts = {"169.254.169.254", "metadata.google.internal", "metadata.google.com"}
+            if hostname in _blocked_hosts:
+                return {
+                    "success": False, "path": "", "size": 0,
+                    "error": f"Access to metadata service is blocked: {hostname}"
+                }
+            
             # Create directory if needed
             os.makedirs(os.path.dirname(safe_path) or ".", exist_ok=True)
             
             # Download file
-            with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
+            with httpx.stream("GET", url, timeout=timeout, follow_redirects=False) as response:
                 response.raise_for_status()
                 
                 total_size = int(response.headers.get("content-length", 0))

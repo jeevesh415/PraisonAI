@@ -21,8 +21,11 @@ Usage:
     praisonai workflow run publish-pypi.yaml --major
 """
 
+import ast
+import operator
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -79,6 +82,19 @@ class JobWorkflowExecutor:
 
         console = Console()
         dry_run = "--dry-run" in args
+        
+        # Security: Require explicit opt-in for job workflows (RCE prevention)
+        if not dry_run and os.environ.get("PRAISONAI_ALLOW_JOB_WORKFLOWS", "").lower() != "true":
+            console.print(Panel(
+                "[bold red]Security Block[/bold red]\n\n"
+                "Job workflows are disabled by default. Set environment variable:\n"
+                "[green]PRAISONAI_ALLOW_JOB_WORKFLOWS=true[/green]\n\n"
+                "Or use --dry-run to preview without execution.",
+                title="⚠️  Security",
+                border_style="red",
+            ))
+            return {"ok": False, "error": "Job workflows disabled. Set PRAISONAI_ALLOW_JOB_WORKFLOWS=true or use --dry-run"}
+        
         flags = self._parse_flags(args)
 
         # Header
@@ -231,10 +247,22 @@ class JobWorkflowExecutor:
 
     def _exec_shell(self, cmd: str, step: Dict) -> Dict:
         """Execute a shell command."""
+        # Block dangerous shell injection characters
+        banned_chars = [';', '&', '|', '$', '`']
+        if any(char in cmd for char in banned_chars):
+            return {"ok": False, "error": "Command contains blocked shell characters"}
+            
         cwd = step.get("cwd", self._cwd)
         env = self._build_env(step)
+        # Use shell=False with shlex.split for safer execution
+        try:
+            args = shlex.split(cmd, posix=(os.name == 'posix'))
+            if not args:
+                return {"ok": False, "error": "Empty command after parsing"}
+        except ValueError as e:
+            return {"ok": False, "error": f"Invalid command syntax: {str(e)}"}
         result = subprocess.run(
-            cmd, shell=True, cwd=cwd, env=env,
+            args, shell=False, cwd=cwd, env=env,
             capture_output=True, text=True,
             timeout=step.get("timeout", 300),
         )
@@ -267,12 +295,24 @@ class JobWorkflowExecutor:
 
     def _exec_inline_python(self, code: str, step: Dict, flags: Dict) -> Dict:
         """Execute inline Python code in an isolated namespace."""
+        _safe_builtins = {
+            "True": True, "False": False, "None": None,
+            "int": int, "float": float, "str": str, "bool": bool,
+            "list": list, "dict": dict, "tuple": tuple, "set": set,
+            "len": len, "range": range, "enumerate": enumerate,
+            "zip": zip, "map": map, "filter": filter,
+            "sorted": sorted, "reversed": reversed,
+            "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
+            "isinstance": isinstance, "type": type,
+            "print": print, "repr": repr,
+            "hasattr": hasattr, "getattr": getattr, "setattr": setattr,
+        }
         namespace = {
             "flags": flags,
             "vars": {k: self._resolve_var_value(v) for k, v in self._vars.items()},
             "env": os.environ.copy(),
             "cwd": self._cwd,
-            "__builtins__": __builtins__,
+            "__builtins__": _safe_builtins,
         }
         try:
             exec(code, namespace)
@@ -698,7 +738,17 @@ class JobWorkflowExecutor:
         env = os.environ.copy()
         step_env = step.get("env", {})
         if step_env:
-            env.update({k: str(v) for k, v in step_env.items()})
+            # Filter out potentially dangerous environment variables
+            dangerous_env_vars = {
+                'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 
+                'PYTHONPATH', 'NODE_PATH', 'PATH', 'SHELL', 'HOME',
+                'TEMP', 'TMP', 'TMPDIR'
+            }
+            filtered_env = {}
+            for k, v in step_env.items():
+                if k.upper() not in dangerous_env_vars:
+                    filtered_env[k] = str(v)
+            env.update(filtered_env)
         return env
 
     # ------------------------------------------------------------------
@@ -719,18 +769,82 @@ class JobWorkflowExecutor:
     # ------------------------------------------------------------------
 
     def _eval_condition(self, condition: str, flags: Dict) -> bool:
-        """Evaluate a simple condition expression."""
+        """Evaluate a simple condition expression safely using AST evaluation."""
         # Strip {{ }} if present
         condition = condition.strip()
         if condition.startswith("{{") and condition.endswith("}}"):
             condition = condition[2:-2].strip()
 
+        # Parse and validate AST - only allow safe node types
+        try:
+            tree = ast.parse(condition, mode='eval')
+        except SyntaxError:
+            return False
+
         # Build evaluation context
         context = {"flags": type("Flags", (), flags)(), "env": os.environ}
+        
         try:
-            return bool(eval(condition, {"__builtins__": {}}, context))
+            return bool(self._safe_eval_ast(tree.body, context))
         except Exception:
             return False
+    
+    def _safe_eval_ast(self, node, context):
+        """Safely evaluate AST node without using eval()."""
+        # Map of safe binary/unary/comparison operations
+        ops = {
+            ast.Add: operator.add, ast.Sub: operator.sub,
+            ast.Mult: operator.mul, ast.Div: operator.truediv,
+            ast.Mod: operator.mod, ast.Pow: operator.pow,
+            ast.Eq: operator.eq, ast.NotEq: operator.ne,
+            ast.Lt: operator.lt, ast.LtE: operator.le,
+            ast.Gt: operator.gt, ast.GtE: operator.ge,
+            ast.Is: operator.is_, ast.IsNot: operator.is_not,
+            ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+            ast.Not: operator.not_,
+        }
+        
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.Name):
+            if node.id in context:
+                return context[node.id]
+            raise NameError(f"name '{node.id}' is not defined")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith('__'):
+                raise AttributeError(f"access to attribute '{node.attr}' is not allowed")
+            value = self._safe_eval_ast(node.value, context)
+            return getattr(value, node.attr)
+        elif isinstance(node, ast.BinOp):
+            left = self._safe_eval_ast(node.left, context)
+            right = self._safe_eval_ast(node.right, context)
+            return ops[type(node.op)](left, right)
+        elif isinstance(node, ast.UnaryOp):
+            operand = self._safe_eval_ast(node.operand, context)
+            return ops[type(node.op)](operand)
+        elif isinstance(node, ast.Compare):
+            left = self._safe_eval_ast(node.left, context)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = self._safe_eval_ast(comparator, context)
+                if not ops[type(op)](left, right):
+                    return False
+                left = right
+            return True
+        elif isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                for value in node.values:
+                    if not self._safe_eval_ast(value, context):
+                        return False
+                return True
+            elif isinstance(node.op, ast.Or):
+                for value in node.values:
+                    if self._safe_eval_ast(value, context):
+                        return True
+                return False
+            else:
+                raise TypeError(f"unsupported boolean operator: {type(node.op)}")
+        else:
+            raise TypeError(f"unsupported node type: {type(node)}")
 
     # ------------------------------------------------------------------
     # Helpers

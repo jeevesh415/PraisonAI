@@ -1,9 +1,11 @@
 import logging
+from praisonaiagents._logging import get_logger
 import os
 import warnings
 import re
 import inspect
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union, Literal, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -71,7 +73,9 @@ except ImportError:
 # Logging is already configured in _logging.py via __init__.py
 
 # TODO: Include in-build tool calling in LLM class
-# TODO: Restructure so that duplicate calls are not made (Sync with agent.py)
+# NOTE: The custom-LLM path (Agent.chat → get_response) and OpenAI path
+# (Agent.chat → _chat_completion) are separate code paths, not duplicate
+# API calls per request. This is a DRY/maintenance concern, not a billing issue.
 class LLMContextLengthExceededException(Exception):
     """Raised when LLM context length is exceeded"""
     def __init__(self, message: str):
@@ -87,6 +91,34 @@ class LLMContextLengthExceededException(Exception):
             "context_length_exceeded"
         ]
         return any(phrase in error_message.lower() for phrase in context_limit_phrases)
+
+@dataclass
+class TokenUsage:
+    """
+    Token usage information from LLM response.
+    
+    This class provides structured access to token consumption data
+    returned by language models, enabling cost tracking and observability.
+    """
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    audio_input_tokens: int = 0
+    audio_output_tokens: int = 0
+    
+    def to_dict(self) -> Dict[str, int]:
+        """Convert to dictionary format."""
+        return {
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'total_tokens': self.total_tokens,
+            'cached_tokens': self.cached_tokens,
+            'reasoning_tokens': self.reasoning_tokens,
+            'audio_input_tokens': self.audio_input_tokens,
+            'audio_output_tokens': self.audio_output_tokens,
+        }
 
 class LLM:
     """
@@ -204,21 +236,21 @@ Respond with ONLY a valid JSON tool call in this format:
                 litellm._logging._disable_debugging()
             
             # Always suppress litellm's internal debug messages
-            logging.getLogger("litellm.utils").setLevel(logging.WARNING)
-            logging.getLogger("litellm.main").setLevel(logging.WARNING)
-            logging.getLogger("litellm.litellm_logging").setLevel(logging.WARNING)
-            logging.getLogger("litellm.transformation").setLevel(logging.WARNING)
+            get_logger("litellm.utils").setLevel(logging.WARNING)
+            get_logger("litellm.main").setLevel(logging.WARNING)
+            get_logger("litellm.litellm_logging").setLevel(logging.WARNING)
+            get_logger("litellm.transformation").setLevel(logging.WARNING)
             
             # Allow httpx logging when LOGLEVEL=debug, otherwise suppress it
             loglevel = os.environ.get('LOGLEVEL', 'INFO').upper()
             if loglevel == 'DEBUG':
-                logging.getLogger("litellm.llms.custom_httpx.http_handler").setLevel(logging.INFO)
+                get_logger("litellm.llms.custom_httpx.http_handler").setLevel(logging.INFO)
             else:
-                logging.getLogger("litellm.llms.custom_httpx.http_handler").setLevel(logging.WARNING)
+                get_logger("litellm.llms.custom_httpx.http_handler").setLevel(logging.WARNING)
             
             # Keep asyncio at WARNING unless explicitly in high debug mode
-            logging.getLogger("asyncio").setLevel(logging.WARNING)
-            logging.getLogger("selector_events").setLevel(logging.WARNING)
+            get_logger("asyncio").setLevel(logging.WARNING)
+            get_logger("selector_events").setLevel(logging.WARNING)
             
             # Enable error dropping for cleaner output
             litellm.drop_params = True
@@ -244,7 +276,7 @@ Respond with ONLY a valid JSON tool call in this format:
         """
         # Check for debug logging - either global debug level OR explicit verbose mode
         verbose = config.get('verbose', self.verbose if hasattr(self, 'verbose') else False)
-        should_log = logging.getLogger().getEffectiveLevel() == logging.DEBUG or (not isinstance(verbose, bool) and verbose >= 10)
+        should_log = get_logger().getEffectiveLevel() == logging.DEBUG or (not isinstance(verbose, bool) and verbose >= 10)
         
         if should_log:
             # Mask sensitive information
@@ -380,8 +412,11 @@ Respond with ONLY a valid JSON tool call in this format:
         self.max_tool_repairs = extra_settings.get('max_tool_repairs', 0)  # Will be set to 2 for Ollama if not explicit
         self.force_tool_usage = extra_settings.get('force_tool_usage', 'never')  # Will be set to 'auto' for Ollama if not explicit
         
-        # Apply Ollama-specific defaults after model is set
-        self._apply_ollama_defaults()
+        # Initialize provider adapter for dispatch logic
+        self._provider_adapter = self._initialize_provider_adapter()
+        
+        # Apply provider-specific defaults after adapter is initialized
+        self._apply_provider_defaults()
         
         # Token tracking
         self.last_token_metrics: Optional[TokenMetrics] = None
@@ -442,15 +477,75 @@ Respond with ONLY a valid JSON tool call in this format:
             self._console = _get_console()()
         return self._console
 
-    def _apply_ollama_defaults(self):
-        """Apply Ollama-specific defaults for tool calling reliability."""
+    def _detect_provider(self) -> str:
+        """
+        Detect provider from model name.
+        
+        Consolidates all provider detection logic into a single method
+        that replaces scattered _is_X_provider() calls.
+        
+        Returns:
+            Provider name (e.g., "ollama", "anthropic", "gemini", "openai")
+        """
+        if not self.model:
+            return "default"
+        
+        model_lower = self.model.lower()
+        
+        # Parse route prefix for explicit provider routing
+        provider_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else None
+        
+        # Explicit provider prefixes take priority
+        if provider_prefix == "ollama":
+            return "ollama"
+        if provider_prefix in {"anthropic", "claude"}:
+            return "anthropic"
+        if provider_prefix in {"gemini", "google"} and "gemini" in model_lower:
+            return "gemini"
+        
+        # Use existing robust Ollama detection logic first
         if self._is_ollama_provider():
-            # Apply defaults only if not explicitly set by user
-            if not self._max_tool_repairs_explicit:
-                self.max_tool_repairs = 2
-            if not self._force_tool_usage_explicit:
-                self.force_tool_usage = 'auto'
-            logging.debug(f"[OLLAMA_RELIABILITY] Applied Ollama defaults: max_tool_repairs={self.max_tool_repairs}, force_tool_usage={self.force_tool_usage}")
+            return "ollama"
+        
+        # Check for direct model name patterns (not substrings)
+        if model_lower.startswith("claude"):
+            return "anthropic"
+        
+        if model_lower.startswith("gemini") or model_lower.startswith("google/gemini"):
+            return "gemini"
+        
+        # Check base_url for provider hints
+        base_urls = [self.base_url, os.getenv("OPENAI_BASE_URL", ""), os.getenv("OPENAI_API_BASE", "")]
+        if any(url and ("ollama" in url.lower() or ":11434" in url) for url in base_urls):
+            return "ollama"
+        
+        # Default fallback
+        return "openai"
+    
+    def _initialize_provider_adapter(self):
+        """Initialize provider adapter based on detected provider."""
+        provider = self._detect_provider()
+        
+        # Import here to avoid circular imports
+        from .adapters import get_provider_adapter
+        adapter = get_provider_adapter(provider)
+        
+        logging.debug(f"[ADAPTER] Initialized {provider} adapter: {adapter.__class__.__name__}")
+        return adapter
+    
+    def _apply_provider_defaults(self):
+        """Apply provider-specific defaults via adapter pattern."""
+        if hasattr(self, '_provider_adapter') and self._provider_adapter:
+            defaults = self._provider_adapter.get_default_settings()
+            if defaults:
+                # Apply defaults only if not explicitly set by user
+                if not self._max_tool_repairs_explicit and 'max_tool_repairs' in defaults:
+                    self.max_tool_repairs = defaults['max_tool_repairs']
+                if not self._force_tool_usage_explicit and 'force_tool_usage' in defaults:
+                    self.force_tool_usage = defaults['force_tool_usage']
+                
+                if defaults:  # Only log if there were actual defaults
+                    logging.debug(f"[PROVIDER_DEFAULTS] Applied {self._provider_adapter.__class__.__name__} defaults: {defaults}")
 
     def _is_ollama_provider(self) -> bool:
         """Detect if this is an Ollama provider regardless of naming convention"""
@@ -721,14 +816,22 @@ Respond with ONLY a valid JSON tool call in this format:
 
     def _supports_prompt_caching(self) -> bool:
         """
-        Check if the current model supports prompt caching via LiteLLM.
+        Check if the current model supports prompt caching.
         
-        Prompt caching allows caching parts of prompts to reduce costs and latency.
-        Supported by OpenAI, Anthropic, Bedrock, and Deepseek.
+        Uses provider adapter to eliminate scattered provider logic.
         
         Returns:
             bool: True if the model supports prompt caching, False otherwise
         """
+        if hasattr(self, '_provider_adapter') and self._provider_adapter:
+            adapter_support = self._provider_adapter.supports_prompt_caching()
+            if adapter_support:
+                return True
+            # If adapter says False and is not the default, trust the adapter
+            if self._provider_adapter.__class__.__name__ != 'DefaultAdapter':
+                return False
+        
+        # Fallback to model capabilities for DefaultAdapter or uninitialized
         from .model_capabilities import supports_prompt_caching
         return supports_prompt_caching(self.model)
 
@@ -1238,12 +1341,20 @@ Now provide your final answer using this result. Summarize the information natur
                 - final_response_text: Text to use as final response (None if continuing)
                 - iteration_count: Updated iteration count
         """
-        if not (self._is_ollama_provider() and iteration_count >= self.OLLAMA_SUMMARY_ITERATION_THRESHOLD):
+        # Use provider adapter to determine if tool summarization should occur
+        # Adapter should always be initialized, but provide safe fallback
+        if hasattr(self, '_provider_adapter') and self._provider_adapter:
+            should_summarize = self._provider_adapter.should_summarize_tools(iteration_count)
+        else:
+            # Conservative fallback without provider detection
+            should_summarize = iteration_count >= 5  # Conservative default
+            
+        if not should_summarize:
             return False, None, iteration_count
             
-        # For Ollama: if we have meaningful tool results, generate summary immediately
-        # Don't wait for more iterations as Ollama tends to repeat tool calls
-        if accumulated_tool_results and iteration_count >= self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
+        # If we should summarize: if we have meaningful tool results, generate summary immediately
+        # Don't wait for more iterations as some providers tend to repeat tool calls
+        if accumulated_tool_results and should_summarize:
             # Generate summary from tool results
             tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
             if tool_summary:
@@ -1269,9 +1380,7 @@ Now provide your final answer using this result. Summarize the information natur
         """
         Check if the current provider supports streaming with tools.
         
-        Most providers that support tool calling also support streaming with tools,
-        but some providers (like Ollama and certain local models) require non-streaming
-        calls when tools are involved.
+        Uses provider adapter to eliminate scattered provider logic.
         
         Returns:
             bool: True if provider supports streaming with tools, False otherwise
@@ -1279,32 +1388,11 @@ Now provide your final answer using this result. Summarize the information natur
         if not self.model:
             return False
         
-        # Ollama doesn't reliably support streaming with tools
-        if self._is_ollama_provider():
-            return False
+        # Use provider adapter for streaming with tools support
+        if hasattr(self, '_provider_adapter') and self._provider_adapter:
+            return self._provider_adapter.supports_streaming_with_tools()
         
-        # Import the capability check function
-        from .model_capabilities import supports_streaming_with_tools
-        
-        # Check if this model supports streaming with tools
-        if supports_streaming_with_tools(self.model):
-            return True
-        
-        # Anthropic Claude models support streaming with tools
-        if self.model.startswith("claude-"):
-            return True
-        
-        # Google Gemini models support streaming with tools
-        if any(self.model.startswith(prefix) for prefix in ["gemini-", "gemini/"]):
-            return True
-        
-        # Models with XML tool format support streaming with tools
-        if self._supports_xml_tool_format():
-            return True
-        
-        # For other providers, default to False to be safe
-        # This ensures we make a single non-streaming call rather than risk
-        # missing tool calls or making duplicate calls
+        # Fallback to conservative default if adapter not initialized
         return False
     
     def _build_messages(self, prompt, system_prompt=None, chat_history=None, output_json=None, output_pydantic=None, tools=None):
@@ -1564,10 +1652,24 @@ Now provide your final answer using this result. Summarize the information natur
         stream: bool = True,
         stream_callback: Optional[Callable] = None,
         emit_events: bool = False,
+        return_token_usage: bool = False,
         **kwargs
-    ) -> str:
+    ) -> Union[str, tuple[str, TokenUsage]]:
         """Enhanced get_response with all OpenAI-like features"""
         logging.debug(f"Getting response from {self.model}")
+        
+        # Variable to store final response for token usage extraction
+        _final_llm_response = None
+
+        # Helper closure to return appropriate format based on return_token_usage
+        def _prepare_return_value(text: str) -> Union[str, tuple]:
+            if not return_token_usage:
+                return text
+            token_usage = self._extract_token_usage(_final_llm_response) if _final_llm_response else None
+            if token_usage is None:
+                token_usage = TokenUsage()
+            return text, token_usage
+
         # Log all self values when in debug mode
         self._log_llm_config(
             'LLM instance',
@@ -1862,6 +1964,7 @@ Now provide your final answer using this result. Summarize the information natur
                         reasoning_content = resp["choices"][0]["message"].get("provider_specific_fields", {}).get("reasoning_content")
                         response_text = resp["choices"][0]["message"]["content"]
                         final_response = resp
+                        _final_llm_response = resp  # Store for token usage extraction
                         
                         # Emit StreamEvent for reasoning content if callback provided
                         if _emit and reasoning_content:
@@ -2092,6 +2195,7 @@ Now provide your final answer using this result. Summarize the information natur
                                                     **kwargs
                                                 )
                                             )
+                                            _final_llm_response = final_response  # Store for token usage extraction
                                             # Handle None content from Gemini
                                             response_content = final_response["choices"][0]["message"].get("content")
                                             response_text = response_content if response_content is not None else ""
@@ -2283,6 +2387,7 @@ Now provide your final answer using this result. Summarize the information natur
                                             **kwargs
                                         )
                                     )
+                                    _final_llm_response = final_response  # Store for token usage extraction
                                 # Handle None content from Gemini
                                 response_content = final_response["choices"][0]["message"].get("content")
                                 response_text = response_content if response_content is not None else ""
@@ -2696,7 +2801,7 @@ Now provide your final answer using this result. Summarize the information natur
                         task_id=task_id
                     )
                     callback_executed = True
-                return final_response_text
+                return _prepare_return_value(final_response_text)
             
             # No tool calls were made in this iteration, return the response
             generation_time_val = time.time() - start_time
@@ -2785,7 +2890,7 @@ Now provide your final answer using this result. Summarize the information natur
                         task_id=task_id
                     )
                     callback_executed = True
-                return response_text
+                return _prepare_return_value(response_text)
 
             if not self_reflect:
                 if verbose and not interaction_displayed:
@@ -2814,8 +2919,8 @@ Now provide your final answer using this result. Summarize the information natur
                 
                 # Return reasoning content if reasoning_steps is True
                 if reasoning_steps and stored_reasoning_content:
-                    return stored_reasoning_content
-                return response_text
+                    return _prepare_return_value(stored_reasoning_content)
+                return _prepare_return_value(response_text)
 
             # Handle self-reflection loop
             while reflection_count < max_reflect:
@@ -2997,7 +3102,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
-                        return response_text
+                        return _prepare_return_value(response_text)
                     continue
                 except Exception as e:
                     _get_display_functions()['display_error'](f"Error in LLM response: {str(e)}")
@@ -3008,14 +3113,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 _get_display_functions()['display_interaction'](prompt, response_text, markdown=markdown,
                                  generation_time=time.time() - start_time, console=self.console)
                 interaction_displayed = True
-            return response_text
+            return _prepare_return_value(response_text)
 
         except Exception as error:
             _get_display_functions()['display_error'](f"Error in get_response: {str(error)}")
             raise
-        
+
         # Log completion time if in debug mode
-        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        if get_logger().getEffectiveLevel() == logging.DEBUG:
             total_time = time.time() - start_time
             logging.debug(f"get_response completed in {total_time:.2f} seconds")
 
@@ -3407,7 +3512,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             formatted_tools = self._format_tools_for_litellm(tools)
 
             # Initialize variables for iteration loop
-            max_iterations = 10  # Prevent infinite loops
+            max_iterations = 50  # Prevent infinite loops
             iteration_count = 0
             final_response_text = ""
             stored_reasoning_content = None  # Store reasoning content from tool execution
@@ -3484,7 +3589,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         for tool_call in tool_calls:
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call)
                             logging.debug(f"[RESPONSES_API_ASYNC] Executing tool {function_name}")
-                            tool_result = execute_tool_fn(function_name, arguments, tool_call_id=tool_call_id)
+                            if asyncio.iscoroutinefunction(execute_tool_fn):
+                                tool_result = await execute_tool_fn(function_name, arguments, tool_call_id=tool_call_id)
+                            else:
+                                tool_result = execute_tool_fn(function_name, arguments, tool_call_id=tool_call_id)
                             accumulated_tool_results.append(tool_result)
 
                             if verbose:
@@ -3567,6 +3675,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if formatted_tools and not self._supports_streaming_tools():
                         # Provider doesn't support streaming with tools, use non-streaming
                         use_streaming = False
+                    # Also disable if provider adapter explicitly disables streaming entirely
+                    if use_streaming and hasattr(self, '_provider_adapter') and self._provider_adapter:
+                        if not self._provider_adapter.supports_streaming():
+                            use_streaming = False
                     
                     if use_streaming:
                         # Streaming approach (with or without tools)
@@ -3789,12 +3901,34 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             interaction_displayed = True
                     else:
                         # Get response after tool calls with streaming if not already handled
-                        if verbose:
+                        _use_stream = stream
+                        if _use_stream and hasattr(self, '_provider_adapter') and self._provider_adapter:
+                            if not self._provider_adapter.supports_streaming():
+                                _use_stream = False
+                        if not _use_stream:
+                            resp = await litellm.acompletion(
+                                **self._build_completion_params(
+                                    messages=messages,
+                                    temperature=temperature,
+                                    stream=False,
+                                    tools=formatted_tools,
+                                    output_json=output_json,
+                                    output_pydantic=output_pydantic,
+                                    **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
+                                )
+                            )
+                            response_text = resp["choices"][0]["message"].get("content") or ""
+                            # If the response also contains new tool_calls, treat this as a
+                            # tool-calling round rather than a final answer (Anthropic pattern)
+                            _next_tool_calls = resp["choices"][0]["message"].get("tool_calls") or []
+                            if _next_tool_calls:
+                                tool_calls = _next_tool_calls
+                        elif verbose:
                             async for chunk in await litellm.acompletion(
                                 **self._build_completion_params(
                                     messages=messages,
                                     temperature=temperature,
-                                    stream=stream,
+                                    stream=_use_stream,
                                     tools=formatted_tools,
                                     output_json=output_json,
                                     output_pydantic=output_pydantic,
@@ -3812,7 +3946,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **self._build_completion_params(
                                     messages=messages,
                                     temperature=temperature,
-                                    stream=stream,
+                                    stream=_use_stream,
                                     output_json=output_json,
                                     output_pydantic=output_pydantic,
                                     **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
@@ -3824,7 +3958,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     response_text = response_text.strip() if response_text else ""
                     
                     # After tool execution, update messages and continue the loop
-                    if response_text:
+                    # Only append as plain assistant message if there are no new tool_calls
+                    # (if tool_calls were set, the tool execution block will format correctly)
+                    if response_text and not tool_calls:
                         messages.append({
                             "role": "assistant",
                             "content": response_text
@@ -3836,8 +3972,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Check if the LLM provided a final answer alongside the tool calls
                     # If response_text contains substantive content, treat it as the final answer
-                    if response_text and len(response_text.strip()) > 10:
-                        # LLM provided a final answer after tool execution, don't continue
+                    if response_text and len(response_text.strip()) > 10 and not tool_calls:
+                        # LLM provided a final answer after tool execution with no further tool calls
                         final_response_text = response_text.strip()
                         break
                     
@@ -3857,7 +3993,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         continue
                     
                     # Safety check: prevent infinite loops for any provider
-                    if iteration_count >= 5:
+                    if iteration_count >= 20:
                         if tool_results:
                             final_response_text = "Task completed successfully based on tool execution results."
                         else:
@@ -4077,7 +4213,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             raise
             
         # Log completion time if in debug mode
-        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        if get_logger().getEffectiveLevel() == logging.DEBUG:
             total_time = time.time() - start_time
             logging.debug(f"get_response_async completed in {total_time:.2f} seconds")
 
@@ -4092,7 +4228,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "LiteLLM is required but not installed. "
                 "Please install it with: pip install 'praisonaiagents[llm]'"
             )
-        except:
+        except Exception as e:
+            # Model capability check failed - assume not supported
+            logger.debug(f"Model capability check failed for {self.model}: {e}")
             return False
 
     def can_use_stop_words(self) -> bool:
@@ -4106,7 +4244,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "LiteLLM is required but not installed. "
                 "Please install it with: pip install 'praisonaiagents[llm]'"
             )
-        except:
+        except Exception as e:
+            # Model capability check failed - assume not supported
+            logger.debug(f"Model capability check failed for {self.model}: {e}")
             return False
 
     def get_context_size(self) -> int:
@@ -4188,6 +4328,49 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         except Exception as e:
             if self.verbose:
                 logging.warning(f"Failed to track token usage: {e}")
+            return None
+    
+    def _extract_token_usage(self, response: Union[Dict[str, Any], Any]) -> Optional[TokenUsage]:
+        """Extract token usage from LiteLLM response for public API."""
+        try:
+            usage = None
+            
+            # Handle both dict and ModelResponse object formats
+            if isinstance(response, dict):
+                usage = response.get("usage", {})
+            else:
+                # ModelResponse object
+                usage = getattr(response, 'usage', None)
+            
+            if not usage:
+                return None
+            
+            # Extract token counts with support for both dict and object access
+            if isinstance(usage, dict):
+                return TokenUsage(
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    cached_tokens=usage.get("cached_tokens", 0),
+                    reasoning_tokens=usage.get("reasoning_tokens", 0),
+                    audio_input_tokens=usage.get("audio_input_tokens", 0),
+                    audio_output_tokens=usage.get("audio_output_tokens", 0),
+                )
+            else:
+                # Object-style access
+                return TokenUsage(
+                    prompt_tokens=getattr(usage, 'prompt_tokens', 0) or 0,
+                    completion_tokens=getattr(usage, 'completion_tokens', 0) or 0,
+                    total_tokens=getattr(usage, 'total_tokens', 0) or 0,
+                    cached_tokens=getattr(usage, 'cached_tokens', 0) or 0,
+                    reasoning_tokens=getattr(usage, 'reasoning_tokens', 0) or 0,
+                    audio_input_tokens=getattr(usage, 'audio_input_tokens', 0) or 0,
+                    audio_output_tokens=getattr(usage, 'audio_output_tokens', 0) or 0,
+                )
+                
+        except Exception as e:
+            if self.verbose:
+                logging.warning(f"Failed to extract token usage: {e}")
             return None
     
     def set_current_agent(self, agent_name: Optional[str]):
@@ -4885,7 +5068,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     def _prepare_response_logging(self, temperature: float, stream: bool, verbose: bool, markdown: bool, **kwargs) -> Optional[Dict[str, Any]]:
         """Prepare debug logging information for response methods"""
-        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        if get_logger().getEffectiveLevel() == logging.DEBUG:
             debug_info = {
                 "model": self.model,
                 "timeout": self.timeout,
@@ -4989,7 +5172,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         try:
             import litellm
             import logging
-            logger = logging.getLogger(__name__)
+            logger = get_logger(__name__)
             
             litellm.set_verbose = False
             start_time = time.time()
@@ -5085,7 +5268,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         try:
             import litellm
             import logging
-            logger = logging.getLogger(__name__)
+            logger = get_logger(__name__)
             
             litellm.set_verbose = False
             start_time = time.time()

@@ -18,8 +18,15 @@ pytest.importorskip("psutil", reason="psutil package not installed")
 class TestListProcessesReliability:
     """Tests for list_processes NoneType bug fix."""
     
+    def _inject_psutil(self):
+        """Inject psutil into shell_tools module for patching."""
+        import psutil
+        import praisonaiagents.tools.shell_tools as st_mod
+        st_mod.psutil = psutil
+    
     def test_list_processes_handles_none_memory_percent(self):
         """list_processes should handle None memory_percent gracefully."""
+        self._inject_psutil()
         from praisonaiagents.tools.shell_tools import ShellTools
         
         # Mock psutil.process_iter to return a process with None memory_percent
@@ -44,6 +51,7 @@ class TestListProcessesReliability:
     
     def test_list_processes_handles_none_cpu_percent(self):
         """list_processes should handle None cpu_percent gracefully."""
+        self._inject_psutil()
         from praisonaiagents.tools.shell_tools import ShellTools
         
         mock_proc = MagicMock()
@@ -65,6 +73,7 @@ class TestListProcessesReliability:
     
     def test_list_processes_handles_both_none(self):
         """list_processes should handle both None values gracefully."""
+        self._inject_psutil()
         from praisonaiagents.tools.shell_tools import ShellTools
         
         mock_proc = MagicMock()
@@ -142,8 +151,8 @@ class TestSearchWebReliability:
         
         # Check that the function has retry logic by inspecting source
         source = inspect.getsource(_search_duckduckgo)
-        assert 'max_retries' in source, "_search_duckduckgo should have retry logic"
-        assert 'retry_delay' in source, "_search_duckduckgo should have retry delay"
+        assert 'retry_with_backoff' in source, "_search_duckduckgo should have retry logic"
+        assert 'retry_with_backoff' in source, "_search_duckduckgo should have retry delay"
 
 
 class TestToolErrorConsistency:

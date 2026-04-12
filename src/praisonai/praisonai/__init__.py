@@ -2,9 +2,14 @@
 import logging
 logging.getLogger('crewai.cli.config').setLevel(logging.ERROR)
 
-# Disable OpenTelemetry SDK
+# Disable OpenTelemetry SDK only when Langfuse is NOT configured
+# (Langfuse v4 requires OTel internally for tracing)
 import os
-os.environ["OTEL_SDK_DISABLED"] = "true"
+_langfuse_configured = bool(os.getenv("LANGFUSE_PUBLIC_KEY") or os.path.exists(
+    os.path.expanduser("~/.praisonai/langfuse.env")
+))
+if not _langfuse_configured:
+    os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 os.environ["EC_TELEMETRY"] = "false"
 
 # Version is lightweight, import directly
@@ -23,6 +28,12 @@ __all__ = [
     'recipe',
     'embed',
     'embedding',
+    'DB',  # Short alias for PraisonAIDB — recommended for simplicity
+    'ManagedAgent',
+    'ManagedConfig',
+    'AnthropicManagedAgent',
+    'LocalManagedAgent',
+    'LocalManagedConfig',
 ]
 
 
@@ -71,6 +82,24 @@ def __getattr__(name):
         # Silent alias for AgentOS (backward compatibility)
         from .app import AgentOS
         return AgentOS
+    elif name in ('ManagedAgent', 'ManagedAgentIntegration'):
+        from .integrations.managed_agents import ManagedAgent
+        return ManagedAgent
+    elif name == 'AnthropicManagedAgent':
+        from .integrations.managed_agents import AnthropicManagedAgent
+        return AnthropicManagedAgent
+    elif name == 'LocalManagedAgent':
+        from .integrations.managed_local import LocalManagedAgent
+        return LocalManagedAgent
+    elif name == 'LocalManagedConfig':
+        from .integrations.managed_local import LocalManagedConfig
+        return LocalManagedConfig
+    elif name in ('ManagedConfig', 'ManagedBackendConfig'):
+        from .integrations.managed_agents import ManagedConfig
+        return ManagedConfig
+    elif name in ('DB', 'PraisonAIDB', 'PraisonDB'):
+        from .db.adapter import DB
+        return DB
     
     # Try praisonaiagents exports
     try:

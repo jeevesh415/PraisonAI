@@ -853,7 +853,36 @@ from praisonaiagents import Agent
 # Define a simple tool
 def calculator(expression: str) -> str:
     """Calculate a math expression."""
-    return str(eval(expression))
+    import ast
+    import operator
+    
+    # Safe operations mapping
+    ops = {
+        ast.Add: operator.add, ast.Sub: operator.sub,
+        ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.Mod: operator.mod,
+        ast.USub: operator.neg, ast.UAdd: operator.pos,
+    }
+    
+    def _eval_node(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.BinOp):
+            left = _eval_node(node.left)
+            right = _eval_node(node.right)
+            return ops[type(node.op)](left, right)
+        elif isinstance(node, ast.UnaryOp):
+            operand = _eval_node(node.operand)
+            return ops[type(node.op)](operand)
+        else:
+            raise TypeError(f"Unsupported operation: {type(node)}")
+    
+    try:
+        tree = ast.parse(expression.strip(), mode='eval')
+        result = _eval_node(tree.body)
+        return str(result)
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, KeyError) as e:
+        return f"Error: {e}"
 
 # Create agent with tool
 agent = Agent(
@@ -924,7 +953,7 @@ print(result)
             "",
             "## CRITICAL RULES:",
             f"1. ONE-LINE docstring: `\"\"\"{name} - Advanced Example\"\"\"`",
-            "2. MUST use real imports: `from praisonaiagents import Agent, Task, Agents`",
+            "2. MUST use real imports: `from praisonaiagents import Agent, Task, AgentTeam`",
             "3. Use AgentTeam() NOT PraisonAIAgentTeam() - Agents is the correct alias",
             "4. NO mock classes - use the REAL classes from praisonaiagents",
             "5. FLAT CODE - NO class definitions (simple def OK for tools/guardrails)",
@@ -1033,7 +1062,7 @@ print(result)
         # Generate dynamic sections
         sections.append(f'''```python
 """{name} - Advanced Example"""
-from praisonaiagents import Agent, Task, Agents
+from praisonaiagents import Agent, Task, AgentTeam
 
 # Section 1: Basic {slug} usage
 agent1 = Agent(instructions="Demonstrate {slug}", {param_name}={param_value})

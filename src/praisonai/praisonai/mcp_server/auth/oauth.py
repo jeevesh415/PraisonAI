@@ -371,14 +371,15 @@ class OAuthManager:
         Returns:
             True if valid
         """
+        import hmac
         # Check if we have this token stored
         for stored_token in self._tokens.values():
-            if stored_token.access_token == token:
+            # Use hmac.compare_digest to prevent timing attacks
+            if hmac.compare_digest(stored_token.access_token, token):
                 return not stored_token.is_expired()
         
-        # For external tokens, we'd need to call the introspection endpoint
-        # This is a simplified implementation
-        return True
+        # Token not found — deny by default
+        return False
     
     def store_token(self, session_id: str, token: TokenResponse) -> None:
         """Store a token for a session."""

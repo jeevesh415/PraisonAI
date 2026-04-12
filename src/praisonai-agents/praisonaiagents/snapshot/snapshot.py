@@ -6,6 +6,7 @@ Provides file change tracking using a shadow git repository.
 
 import hashlib
 import logging
+from praisonaiagents._logging import get_logger
 import os
 import shutil
 import subprocess
@@ -16,11 +17,10 @@ from typing import Any, Dict, List, Optional
 
 from ..paths import get_snapshots_dir
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Default snapshot directory (uses centralized paths - DRY)
 DEFAULT_SNAPSHOT_DIR = str(get_snapshots_dir())
-
 
 @dataclass
 class FileDiff:
@@ -50,7 +50,6 @@ class FileDiff:
             diff_content=data.get("diff_content", ""),
             status=data.get("status", "modified"),
         )
-
 
 @dataclass
 class SnapshotInfo:
@@ -90,7 +89,6 @@ class SnapshotInfo:
             deletions=data.get("deletions", 0),
         )
 
-
 class FileSnapshot:
     """
     File snapshot manager using a shadow git repository.
@@ -118,6 +116,8 @@ class FileSnapshot:
         project_path: str,
         snapshot_dir: Optional[str] = None,
         session_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        user_email: Optional[str] = None,
     ):
         """
         Initialize the file snapshot manager.
@@ -126,14 +126,26 @@ class FileSnapshot:
             project_path: Path to the project to track
             snapshot_dir: Optional custom snapshot directory
             session_id: Optional session ID for grouping snapshots
+            user_name: Git user.name for commits (default: from env PRAISONAI_GIT_USER_NAME or "PraisonAI Snapshot")
+            user_email: Git user.email for commits (default: from env PRAISONAI_GIT_USER_EMAIL or "praison@snapshot.local")
         """
         self.project_path = os.path.abspath(project_path)
         self.session_id = session_id
+        self.user_name = user_name or os.getenv("PRAISONAI_GIT_USER_NAME", "PraisonAI Snapshot")
+        self.user_email = user_email or os.getenv("PRAISONAI_GIT_USER_EMAIL", "praison@snapshot.local")
         
         # Create unique shadow repo path based on project path hash
-        project_hash = hashlib.md5(self.project_path.encode()).hexdigest()[:12]
         base_dir = snapshot_dir or DEFAULT_SNAPSHOT_DIR
-        self.shadow_path = os.path.join(base_dir, project_hash)
+        project_hash = hashlib.sha256(self.project_path.encode()).hexdigest()[:12]
+        new_shadow_path = os.path.join(base_dir, project_hash)
+        # Backward compat: adopt legacy snapshot directory if present
+        legacy_hash = hashlib.md5(self.project_path.encode()).hexdigest()[:12]  # noqa: S324
+        legacy_shadow_path = os.path.join(base_dir, legacy_hash)
+        self.shadow_path = (
+            legacy_shadow_path
+            if (not os.path.exists(new_shadow_path) and os.path.exists(legacy_shadow_path))
+            else new_shadow_path
+        )
         
         self._initialized = False
     
@@ -162,8 +174,8 @@ class FileSnapshot:
         if not os.path.exists(self.shadow_path):
             os.makedirs(self.shadow_path, exist_ok=True)
             self._run_git("init", cwd=self.shadow_path)
-            self._run_git("config", "user.email", "praison@snapshot.local")
-            self._run_git("config", "user.name", "PraisonAI Snapshot")
+            self._run_git("config", "user.email", self.user_email)
+            self._run_git("config", "user.name", self.user_name)
             
             # Create initial empty commit
             self._run_git("commit", "--allow-empty", "-m", "Initial snapshot")

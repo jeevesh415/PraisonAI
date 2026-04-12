@@ -3,127 +3,35 @@ import sqlite3
 import json
 import time
 import shutil
+import threading
 from typing import Any, Dict, List, Optional, Union, Literal
 import logging
+from praisonaiagents._logging import get_logger
 from datetime import datetime
+
+# Decomposed memory functionality - imported as mixins for backward compatibility
+from .storage import StorageMixin
+from .search import SearchMixin
+from .core import MemoryCoreMixin
+
+# Protocol-driven imports (AGENTS.md compliant)
+from .protocols import MemoryProtocol
+from .adapters import get_memory_adapter, get_first_available_memory_adapter
+from .adapters.sqlite_adapter import SqliteMemoryAdapter
 
 # Disable litellm telemetry before any imports
 os.environ["LITELLM_TELEMETRY"] = "False"
 
-# Set up logger with custom TRACE level
-logger = logging.getLogger(__name__)
+# Set up logger using centralized logging utility
+logger = get_logger(__name__, extra_data={"subsystem": "memory"})
 
 # Add custom TRACE level (below DEBUG)
 TRACE_LEVEL = 5
 logging.addLevelName(TRACE_LEVEL, 'TRACE')
 
-def trace(self, message, *args, **kwargs):
-    if self.isEnabledFor(TRACE_LEVEL):
-        self._log(TRACE_LEVEL, message, args, **kwargs)
-
-logging.Logger.trace = trace
-
-# Lazy availability flags and cached imports
-_chromadb_cache = {"available": None, "module": None, "settings": None}
-_mem0_cache = {"available": None, "module": None}
-_openai_cache = {"available": None, "module": None}
-_litellm_cache = {"available": None, "module": None}
-_pymongo_cache = {"available": None, "module": None, "client": None}
-
-def _check_chromadb():
-    """Lazily check chromadb availability and cache."""
-    if _chromadb_cache["available"] is None:
-        try:
-            import chromadb
-            from chromadb.config import Settings as ChromaSettings
-            _chromadb_cache["available"] = True
-            _chromadb_cache["module"] = chromadb
-            _chromadb_cache["settings"] = ChromaSettings
-        except ImportError:
-            _chromadb_cache["available"] = False
-    return _chromadb_cache["available"]
-
-def _get_chromadb():
-    """Get chromadb module (lazy load)."""
-    if not _check_chromadb():
-        raise ImportError("chromadb is required. Install with: pip install chromadb")
-    return _chromadb_cache["module"], _chromadb_cache["settings"]
-
-def _check_mem0():
-    """Lazily check mem0 availability."""
-    if _mem0_cache["available"] is None:
-        try:
-            import mem0
-            _mem0_cache["available"] = True
-            _mem0_cache["module"] = mem0
-        except ImportError:
-            _mem0_cache["available"] = False
-    return _mem0_cache["available"]
-
-def _get_mem0():
-    """Get mem0 module (lazy load)."""
-    if not _check_mem0():
-        raise ImportError("mem0 is required. Install with: pip install mem0ai")
-    return _mem0_cache["module"]
-
-def _check_openai():
-    """Lazily check openai availability."""
-    if _openai_cache["available"] is None:
-        try:
-            import openai
-            _openai_cache["available"] = True
-            _openai_cache["module"] = openai
-        except ImportError:
-            _openai_cache["available"] = False
-    return _openai_cache["available"]
-
-def _get_openai():
-    """Get openai module (lazy load)."""
-    if not _check_openai():
-        raise ImportError("openai is required. Install with: pip install openai")
-    return _openai_cache["module"]
-
-def _check_litellm():
-    """Lazily check litellm availability."""
-    if _litellm_cache["available"] is None:
-        try:
-            import litellm
-            litellm.telemetry = False
-            _litellm_cache["available"] = True
-            _litellm_cache["module"] = litellm
-        except ImportError:
-            _litellm_cache["available"] = False
-    return _litellm_cache["available"]
-
-def _get_litellm():
-    """Get litellm module (lazy load)."""
-    if not _check_litellm():
-        raise ImportError("litellm is required. Install with: pip install litellm")
-    return _litellm_cache["module"]
-
-def _check_pymongo():
-    """Lazily check pymongo availability."""
-    if _pymongo_cache["available"] is None:
-        try:
-            import pymongo
-            from pymongo import MongoClient
-            _pymongo_cache["available"] = True
-            _pymongo_cache["module"] = pymongo
-            _pymongo_cache["client"] = MongoClient
-        except ImportError:
-            _pymongo_cache["available"] = False
-    return _pymongo_cache["available"]
-
-def _get_pymongo():
-    """Get pymongo module and MongoClient (lazy load)."""
-    if not _check_pymongo():
-        raise ImportError("pymongo is required. Install with: pip install pymongo")
-    return _pymongo_cache["module"], _pymongo_cache["client"]
 
 
-
-
-class Memory:
+class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
     """
     A single-file memory manager covering:
     - Short-term memory (STM) for ephemeral context
@@ -191,28 +99,94 @@ class Memory:
         
         # Set logger level based on verbose
         if verbose >= 5:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(10)  # DEBUG
         else:
-            logger.setLevel(logging.WARNING)
-            
-        # Also set ChromaDB and OpenAI client loggers to WARNING
-        logging.getLogger('chromadb').setLevel(logging.WARNING)
-        logging.getLogger('openai').setLevel(logging.WARNING)
-        logging.getLogger('httpx').setLevel(logging.WARNING)
-        logging.getLogger('httpcore').setLevel(logging.WARNING)
-        logging.getLogger('chromadb.segment.impl.vector.local_persistent_hnsw').setLevel(logging.ERROR)
-        logging.getLogger('utils').setLevel(logging.WARNING)
-        logging.getLogger('litellm.utils').setLevel(logging.WARNING)
-            
-        self.provider = self.cfg.get("provider", "rag")
-        self.use_mem0 = (self.provider.lower() == "mem0") and _check_mem0()
-        self.use_rag = (self.provider.lower() == "rag") and _check_chromadb() and self.cfg.get("use_embedding", False)
-        self.use_mongodb = (self.provider.lower() == "mongodb") and _check_pymongo()
-        self.graph_enabled = False  # Initialize graph support flag
+            logger.setLevel(30)  # WARNING
+
+        # Suppress noisy loggers from dependencies
+        self._configure_dependency_logging()
+        
+        # Initialize core protocol-driven memory system
+        self._init_protocol_driven_memory()
+        
+        # Backward compatibility: Initialize SQLite-based STM/LTM for legacy API
+        self._init_legacy_compatibility()
+        
+        # Initialize learning manager if configured
         self._learn_manager = None  # Lazy-loaded LearnManager
         self._learn_config = self.cfg.get("learn", None)  # Learn configuration
+
+    def _configure_dependency_logging(self):
+        """Suppress verbose logging from heavy dependencies."""
+        import logging as _logging
+        for logger_name in [
+            'chromadb', 'openai', 'httpx', 'httpcore', 'litellm.utils',
+            'chromadb.segment.impl.vector.local_persistent_hnsw', 'utils'
+        ]:
+            get_logger(logger_name).setLevel(_logging.WARNING)
+
+    def _init_protocol_driven_memory(self):
+        """Initialize memory using adapter registry (protocol-driven approach)."""
+        # Determine provider preference
+        provider = self.cfg.get("provider", "rag").lower()
+        self._log_verbose(f"Requested memory provider: {provider}")
         
-        # Extract embedding model from config
+        # Map legacy provider names to adapter names
+        provider_mapping = {
+            "rag": "chroma",  # Legacy "rag" provider uses ChromaDB
+            "mem0": "mem0",
+            "mongodb": "mongodb",
+            "sqlite": "sqlite",
+            "none": "in_memory"
+        }
+        
+        adapter_name = provider_mapping.get(provider, provider)
+        
+        # Try to get preferred adapter, fallback to available ones
+        try:
+            adapter_config = self._get_adapter_config_for_provider(adapter_name)
+            adapter = get_memory_adapter(adapter_name, **adapter_config)
+        except RuntimeError as exc:
+            self._log_verbose(
+                f"Failed to initialize '{adapter_name}': {exc}",
+                logging.WARNING,
+            )
+            adapter = None
+        
+        if adapter is None:
+            # Fallback to first available adapter
+            self._log_verbose(f"Provider '{adapter_name}' not available, trying fallbacks")
+            # Try each fallback preference individually
+            for fallback_provider in ["sqlite", "in_memory"]:
+                try:
+                    fallback_config = self._get_adapter_config_for_provider(fallback_provider)
+                    adapter = get_memory_adapter(fallback_provider, **fallback_config)
+                    if adapter:
+                        adapter_name = fallback_provider
+                        self._log_verbose(f"Using fallback adapter: {adapter_name}")
+                        break
+                except Exception as e:
+                    self._log_verbose(f"Fallback {fallback_provider} failed: {e}")
+                    continue
+            
+            if not adapter:
+                raise RuntimeError("No memory adapters available")
+        
+        # Store adapter and metadata
+        self.memory_adapter = adapter
+        self.provider = adapter_name
+        self._log_verbose(f"Initialized memory adapter: {adapter_name}")
+        
+        # Set legacy flags for backward compatibility
+        self.use_mem0 = (adapter_name == "mem0")
+        self.use_rag = (adapter_name == "chroma") 
+        self.use_mongodb = (adapter_name == "mongodb")
+        self.use_embedding = adapter_name in ['chroma', 'mongodb']
+        
+        # Check if adapter supports advanced features
+        self.graph_enabled = hasattr(adapter, 'graph_enabled') and adapter.graph_enabled
+        
+        # Extract embedding model for legacy compatibility
         self.embedder_config = self.cfg.get("embedder", {})
         if isinstance(self.embedder_config, dict):
             embedder_model_config = self.embedder_config.get("config", {})
@@ -220,32 +194,130 @@ class Memory:
         else:
             self.embedding_model = "text-embedding-3-small"
         
-        self._log_verbose(f"Using embedding model: {self.embedding_model}")
-
-        # Determine embedding dimensions based on model
+        # Determine embedding dimensions for legacy compatibility
         self.embedding_dimensions = self._get_embedding_dimensions(self.embedding_model)
-        self._log_verbose(f"Using embedding dimensions: {self.embedding_dimensions}")
 
-        # Create project data directory if it doesn't exist
+    def _get_adapter_config(self) -> Dict[str, Any]:
+        """Get configuration for adapter initialization."""
+        # Only include adapter-relevant configuration
+        config = {}
+        
+        # Add embedding model configuration
+        embedder_config = self.cfg.get("embedder", {})
+        if isinstance(embedder_config, dict):
+            embedder_model_config = embedder_config.get("config", {})
+            config["embedding_model"] = embedder_model_config.get("model", "text-embedding-3-small")
+        else:
+            config["embedding_model"] = "text-embedding-3-small"
+        
+        # Add project data directory paths for file-based adapters
         from ..paths import get_project_data_dir
-        _project_data = str(get_project_data_dir())
-        os.makedirs(_project_data, exist_ok=True)
+        project_data = str(get_project_data_dir())
+        os.makedirs(project_data, exist_ok=True)
+        
+        config["short_db"] = self.cfg.get("short_db", os.path.join(project_data, "short_term.db"))
+        config["long_db"] = self.cfg.get("long_db", os.path.join(project_data, "long_term.db"))
+        config["rag_db_path"] = self.cfg.get("rag_db_path", os.path.join(project_data, "chroma_db"))
+        config["verbose"] = self.verbose
+        
+        # Add specific configurations for different adapters
+        if "config" in self.cfg:
+            config["config"] = self.cfg["config"]
+        
+        return config
 
-        # Short-term DB
-        self.short_db = self.cfg.get("short_db", os.path.join(_project_data, "short_term.db"))
-        self._init_stm()
+    def _get_adapter_config_for_provider(self, provider_name: str) -> Dict[str, Any]:
+        """Get configuration tailored for specific provider."""
+        base_config = self._get_adapter_config()
+        
+        # Filter configuration based on provider requirements
+        if provider_name == "sqlite":
+            return {
+                "short_db": base_config["short_db"],
+                "long_db": base_config["long_db"],
+                "verbose": base_config["verbose"]
+            }
+        elif provider_name == "in_memory":
+            return {
+                "verbose": base_config.get("verbose", 0)
+            }
+        elif provider_name in ["mem0", "chroma", "mongodb"]:
+            # Factory-based adapters accept full config
+            return base_config
+        else:
+            # Default: return base config and let adapter handle filtering
+            return base_config
 
-        # Long-term DB
-        self.long_db = self.cfg.get("long_db", os.path.join(_project_data, "long_term.db"))
-        self._init_ltm()
+    def _init_legacy_compatibility(self):
+        """Initialize legacy compatibility layer for direct SQLite access."""
+        # For backward compatibility, maintain direct SQLite connections
+        # This ensures existing code that accesses _get_stm_conn() still works
+        from ..paths import get_project_data_dir
+        project_data = str(get_project_data_dir())
+        
+        self.short_db = self.cfg.get("short_db", os.path.join(project_data, "short_term.db"))
+        self.long_db = self.cfg.get("long_db", os.path.join(project_data, "long_term.db"))
+        
+        # Only create separate SQLite adapter if primary adapter is not SQLite
+        if self.provider != "sqlite":
+            self._sqlite_adapter = SqliteMemoryAdapter(
+                short_db=self.short_db,
+                long_db=self.long_db,
+                verbose=self.verbose
+            )
+        else:
+            # Reuse the primary adapter
+            self._sqlite_adapter = self.memory_adapter
+        
+        # Thread-local storage and locks (for legacy compatibility)
+        self._local = self._sqlite_adapter._local
+        self._write_lock = self._sqlite_adapter._write_lock
+        self._all_connections = self._sqlite_adapter._all_connections
+        self._connection_lock = self._sqlite_adapter._connection_lock
 
-        # Conditionally init Mem0, MongoDB, or local RAG
-        if self.use_mem0:
-            self._init_mem0()
-        elif self.use_mongodb:
-            self._init_mongodb()
-        elif self.use_rag:
-            self._init_chroma()
+    def _get_stm_conn(self):
+        """Get thread-local short-term memory SQLite connection."""
+        if not hasattr(self._local, 'stm_conn') or self._local.stm_conn is None:
+            self._local.stm_conn = sqlite3.connect(
+                self.short_db,
+                check_same_thread=False,  # Allow cross-thread cleanup
+                timeout=30.0  # 30 second timeout for lock contention
+            )
+            # Configure busy timeout for better contention handling
+            self._local.stm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+            
+            # Enable WAL mode for concurrent read/write without blocking
+            result = self._local.stm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if result and result[0].upper() != 'WAL':
+                logger.warning(f"WAL mode not enabled for STM, got: {result[0]}")
+            self._local.stm_conn.commit()
+            
+            # Register connection for cleanup
+            with self._connection_lock:
+                self._all_connections.add(self._local.stm_conn)
+        return self._local.stm_conn
+
+    def _get_ltm_conn(self):
+        """Get thread-local long-term memory SQLite connection."""
+        if not hasattr(self._local, 'ltm_conn') or self._local.ltm_conn is None:
+            self._local.ltm_conn = sqlite3.connect(
+                self.long_db,
+                check_same_thread=False,  # Allow cross-thread cleanup
+                timeout=30.0  # 30 second timeout for lock contention
+            )
+            # Configure busy timeout for better contention handling
+            self._local.ltm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+            
+            # Enable WAL mode for concurrent read/write without blocking
+            result = self._local.ltm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if result and result[0].upper() != 'WAL':
+                logger.warning(f"WAL mode not enabled for LTM, got: {result[0]}")
+            self._local.ltm_conn.commit()
+            
+            # Register connection for cleanup
+            with self._connection_lock:
+                self._all_connections.add(self._local.ltm_conn)
+        return self._local.ltm_conn
 
     def _log_verbose(self, msg: str, level: int = logging.INFO):
         """Only log if verbose >= 5"""
@@ -267,8 +339,10 @@ class Memory:
                 emitter.memory_store(agent_name, memory_type, content_length, metadata)
             elif event_type == "search":
                 emitter.memory_search(agent_name, query, result_count, memory_type, top_score)
-        except Exception:
-            pass  # Silent fail - tracing should never break memory operations
+        except Exception as e:
+            # Silent fail - tracing should never break memory operations
+            # But log at debug level for troubleshooting
+            logger.debug(f"Memory trace emit failed: {e}")
 
     # -------------------------------------------------------------------------
     #                          Initialization
@@ -276,7 +350,7 @@ class Memory:
     def _init_stm(self):
         """Creates or verifies short-term memory table."""
         os.makedirs(os.path.dirname(self.short_db) or ".", exist_ok=True)
-        conn = sqlite3.connect(self.short_db)
+        conn = self._get_stm_conn()
         c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS short_mem (
@@ -287,12 +361,11 @@ class Memory:
         )
         """)
         conn.commit()
-        conn.close()
 
     def _init_ltm(self):
         """Creates or verifies long-term memory table."""
         os.makedirs(os.path.dirname(self.long_db) or ".", exist_ok=True)
-        conn = sqlite3.connect(self.long_db)
+        conn = self._get_ltm_conn()
         c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS long_mem (
@@ -303,7 +376,6 @@ class Memory:
         )
         """)
         conn.commit()
-        conn.close()
 
     def _init_mem0(self):
         """Initialize Mem0 client for agent or user memory with optional graph support."""
@@ -579,15 +651,15 @@ class Memory:
                 logger.error(f"Failed to store in MongoDB short-term memory: {e}")
                 raise
 
-        # Existing SQLite store logic
+        # Existing SQLite store logic (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.short_db)
-            conn.execute(
-                "INSERT INTO short_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
-                (ident, text, json.dumps(metadata), created_at)
-            )
-            conn.commit()
-            conn.close()
+            conn = self._get_stm_conn()
+            with self._write_lock:  # Serialize write operations
+                conn.execute(
+                    "INSERT INTO short_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
+                    (ident, text, json.dumps(metadata), created_at)
+                )
+                conn.commit()
             logger.info(f"Successfully stored in SQLite short-term memory with ID: {ident}")
         except Exception as e:
             logger.error(f"Failed to store in SQLite short-term memory: {e}")
@@ -613,7 +685,7 @@ class Memory:
             # Pass rerank and other kwargs to Mem0 search
             search_params = {"query": query, "limit": limit, "rerank": rerank}
             search_params.update(kwargs)
-            results = self.mem0_client.search(**search_params)
+            results = self._safe_mem0_search(self.mem0_client, **search_params)
             filtered = [r for r in results if r.get("score", 1.0) >= relevance_cutoff]
             return filtered
             
@@ -713,13 +785,12 @@ class Memory:
         
         else:
             # Local fallback
-            conn = sqlite3.connect(self.short_db)
+            conn = self._get_stm_conn()
             c = conn.cursor()
             rows = c.execute(
                 "SELECT id, content, meta FROM short_mem WHERE content LIKE ? LIMIT ?",
                 (f"%{query}%", limit)
             ).fetchall()
-            conn.close()
 
             results = []
             for row in rows:
@@ -739,10 +810,10 @@ class Memory:
 
     def reset_short_term(self):
         """Completely clears short-term memory."""
-        conn = sqlite3.connect(self.short_db)
-        conn.execute("DELETE FROM short_mem")
-        conn.commit()
-        conn.close()
+        conn = self._get_stm_conn()
+        with self._write_lock:  # Serialize write operations
+            conn.execute("DELETE FROM short_mem")
+            conn.commit()
 
     # -------------------------------------------------------------------------
     #                           Long-Term Methods
@@ -813,15 +884,15 @@ class Memory:
                 logger.error(f"Failed to store in MongoDB long-term memory: {e}")
                 # Continue to SQLite fallback
         
-        # Store in SQLite
+        # Store in SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.long_db)
-            conn.execute(
-                "INSERT INTO long_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
-                (ident, text, json.dumps(metadata), created)
-            )
-            conn.commit()
-            conn.close()
+            conn = self._get_ltm_conn()
+            with self._write_lock:  # Serialize write operations
+                conn.execute(
+                    "INSERT INTO long_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
+                    (ident, text, json.dumps(metadata), created)
+                )
+                conn.commit()
             logger.info(f"Successfully stored in SQLite with ID: {ident}")
         except Exception as e:
             logger.error(f"Error storing in SQLite: {e}")
@@ -835,7 +906,7 @@ class Memory:
                 from praisonaiagents.embedding import embedding as get_embedding
                 
                 logger.info("Getting embeddings...")
-                logger.trace(f"Embedding input text: {text}")
+                logger.log(TRACE_LEVEL, f"Embedding input text: {text}")
                 
                 result = get_embedding(text, model=self.embedding_model)
                 embedding = result.embeddings[0] if result.embeddings else None
@@ -845,7 +916,7 @@ class Memory:
                     return
                     
                 logger.info("Successfully got embeddings")
-                logger.trace(f"Received embedding of length: {len(embedding)}")
+                logger.log(TRACE_LEVEL, f"Received embedding of length: {len(embedding)}")
                 
                 # Sanitize metadata for ChromaDB
                 sanitized_metadata = self._sanitize_metadata(metadata)
@@ -890,7 +961,7 @@ class Memory:
             # Pass rerank and other kwargs to Mem0 search
             search_params = {"query": query, "limit": limit, "rerank": rerank}
             search_params.update(kwargs)
-            results = self.mem0_client.search(**search_params)
+            results = self._safe_mem0_search(self.mem0_client, **search_params)
             # Filter by quality
             filtered = [r for r in results if r.get("metadata", {}).get("quality", 0.0) >= min_quality]
             logger.info(f"Found {len(filtered)} results in Mem0")
@@ -1002,13 +1073,12 @@ class Memory:
                 self._log_verbose(f"Error searching ChromaDB: {e}", logging.ERROR)
 
         # Always try SQLite as fallback or additional source
-        conn = sqlite3.connect(self.long_db)
+        conn = self._get_ltm_conn()
         c = conn.cursor()
         rows = c.execute(
             "SELECT id, content, meta, created_at FROM long_mem WHERE content LIKE ? LIMIT ?",
             (f"%{query}%", limit)
         ).fetchall()
-        conn.close()
 
         for row in rows:
             meta = json.loads(row[2] or "{}")
@@ -1051,10 +1121,10 @@ class Memory:
 
     def reset_long_term(self):
         """Clear local LTM DB, plus Chroma, MongoDB, or mem0 if in use."""
-        conn = sqlite3.connect(self.long_db)
-        conn.execute("DELETE FROM long_mem")
-        conn.commit()
-        conn.close()
+        conn = self._get_ltm_conn()
+        with self._write_lock:  # Serialize write operations
+            conn.execute("DELETE FROM long_mem")
+            conn.commit()
 
         if self.use_mem0 and hasattr(self, "mem0_client"):
             # Mem0 has no universal reset API. Could implement partial or no-op.
@@ -1085,16 +1155,16 @@ class Memory:
         """
         deleted = False
         
-        # Delete from SQLite
+        # Delete from SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.short_db)
-            cursor = conn.execute(
-                "DELETE FROM short_mem WHERE id = ?", (memory_id,)
-            )
-            if cursor.rowcount > 0:
-                deleted = True
-            conn.commit()
-            conn.close()
+            conn = self._get_stm_conn()
+            with self._write_lock:  # Serialize write operations
+                cursor = conn.execute(
+                    "DELETE FROM short_mem WHERE id = ?", (memory_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted = True
+                conn.commit()
         except Exception as e:
             self._log_verbose(f"Error deleting from SQLite short-term: {e}", logging.ERROR)
         
@@ -1126,16 +1196,16 @@ class Memory:
         """
         deleted = False
         
-        # Delete from SQLite
+        # Delete from SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.long_db)
-            cursor = conn.execute(
-                "DELETE FROM long_mem WHERE id = ?", (memory_id,)
-            )
-            if cursor.rowcount > 0:
-                deleted = True
-            conn.commit()
-            conn.close()
+            conn = self._get_ltm_conn()
+            with self._write_lock:  # Serialize write operations
+                cursor = conn.execute(
+                    "DELETE FROM long_mem WHERE id = ?", (memory_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted = True
+                conn.commit()
         except Exception as e:
             self._log_verbose(f"Error deleting from SQLite long-term: {e}", logging.ERROR)
         
@@ -1346,7 +1416,7 @@ class Memory:
             # Pass rerank and other kwargs to Mem0 search
             search_params = {"query": query, "limit": limit, "user_id": user_id, "rerank": rerank}
             search_params.update(kwargs)
-            return self.mem0_client.search(**search_params)
+            return self._safe_mem0_search(self.mem0_client, **search_params)
         elif self.use_mongodb and hasattr(self, "mongo_users"):
             try:
                 results = []
@@ -1413,7 +1483,7 @@ class Memory:
             # Include any additional kwargs
             search_params.update(kwargs)
             
-            return self.mem0_client.search(**search_params)
+            return self._safe_mem0_search(self.mem0_client, **search_params)
         
         # For MongoDB or local memory, use specific search methods
         if user_id:
@@ -1504,7 +1574,7 @@ class Memory:
         """
         # Determine whether to include memory content in output based on logging level
         if include_in_output is None:
-            include_in_output = logging.getLogger().getEffectiveLevel() == logging.DEBUG
+            include_in_output = get_logger().getEffectiveLevel() == logging.DEBUG
         
         q = (task_descr + " " + additional).strip()
         lines = []
@@ -1790,10 +1860,9 @@ class Memory:
         
         try:
             # Get short-term memories
-            conn = sqlite3.connect(self.short_db)
+            conn = self._get_stm_conn()
             c = conn.cursor()
             rows = c.execute("SELECT id, content, meta, created_at FROM short_mem").fetchall()
-            conn.close()
             
             for row in rows:
                 meta = json.loads(row[2] or "{}")
@@ -1806,10 +1875,9 @@ class Memory:
                 })
             
             # Get long-term memories
-            conn = sqlite3.connect(self.long_db)
+            conn = self._get_ltm_conn()
             c = conn.cursor()
             rows = c.execute("SELECT id, content, meta, created_at FROM long_mem").fetchall()
-            conn.close()
             
             for row in rows:
                 meta = json.loads(row[2] or "{}")
@@ -1873,3 +1941,81 @@ class Memory:
         if self.learn is None:
             return ""
         return self.learn.to_system_prompt_context()
+
+    def close_connections(self):
+        """
+        Close database connections.
+        
+        Closes the current thread's connections and attempts to close all known
+        connections from other threads. Each thread should call this method before
+        terminating to ensure proper cleanup.
+        """
+        # Close current thread's connections
+        if hasattr(self._local, 'stm_conn') and self._local.stm_conn:
+            try:
+                self._local.stm_conn.close()
+                self._local.stm_conn = None
+            except Exception as e:
+                logger.warning(f"Error closing current thread's STM connection: {e}")
+        
+        if hasattr(self._local, 'ltm_conn') and self._local.ltm_conn:
+            try:
+                self._local.ltm_conn.close()
+                self._local.ltm_conn = None
+            except Exception as e:
+                logger.warning(f"Error closing current thread's LTM connection: {e}")
+        
+        # Close all known connections from the registry
+        with self._connection_lock:  # Ensure thread safety during cleanup
+            connections_to_close = list(self._all_connections)
+            for conn in connections_to_close:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.debug(f"Error closing registered connection: {e}")
+            # Clear the registry
+            self._all_connections.clear()
+    
+    def __enter__(self):
+        """Allow Memory to be used as a context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure connections are closed when leaving a context manager block."""
+        self.close_connections()
+    
+    def _safe_mem0_search(self, mem0_client, **kwargs):
+        """
+        Defensive wrapper for mem0.search() to handle MongoDB vector store compatibility.
+        
+        Catches TypeError about unexpected 'vectors' kwarg and falls back gracefully.
+        This addresses the upstream mem0 bug: https://github.com/mem0ai/mem0/issues/3185
+        """
+        try:
+            return mem0_client.search(**kwargs)
+        except TypeError as e:
+            error_msg = str(e).lower()
+            if "unexpected keyword argument" in error_msg and "vectors" in error_msg:
+                logger.warning(
+                    "Detected mem0 MongoDB vector store compatibility issue. "
+                    "This is a known upstream bug: https://github.com/mem0ai/mem0/issues/3185. "
+                    "The MongoDB vector store requires Atlas and has signature mismatches. "
+                    "Consider using Qdrant or Chroma as mem0 vector store backends instead."
+                )
+                # Return empty results rather than crashing
+                return []
+            else:
+                # Re-raise if it's a different TypeError
+                raise
+
+    def __del__(self):
+        """
+        Attempt to clean up any open SQLite connections when this instance
+        is garbage-collected. Errors are suppressed to avoid issues during
+        interpreter shutdown.
+        """
+        try:
+            self.close_connections()
+        except Exception as e:
+            # Best-effort cleanup during garbage collection
+            logger.debug(f"Memory cleanup failed: {e}")

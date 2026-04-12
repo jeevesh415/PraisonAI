@@ -20,10 +20,10 @@ Usage:
 
 import os
 import logging
+from praisonaiagents._logging import get_logger
 from typing import Any, Dict, List, Optional, Union
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_available_crawl_providers() -> List[str]:
     """Get list of available crawl providers based on installed packages and API keys."""
@@ -54,7 +54,6 @@ def _get_available_crawl_providers() -> List[str]:
     providers.append("httpx")
     
     return providers
-
 
 def _crawl_with_tavily(urls: List[str]) -> List[Dict[str, Any]]:
     """Crawl URLs using Tavily Extract."""
@@ -90,7 +89,6 @@ def _crawl_with_tavily(urls: List[str]) -> List[Dict[str, Any]]:
             })
     
     return results
-
 
 def _crawl_with_crawl4ai(urls: List[str]) -> List[Dict[str, Any]]:
     """Crawl URLs using Crawl4AI."""
@@ -131,7 +129,6 @@ def _crawl_with_crawl4ai(urls: List[str]) -> List[Dict[str, Any]]:
             return loop.run_until_complete(_crawl_async())
     except RuntimeError:
         return asyncio.run(_crawl_async())
-
 
 def _crawl_with_httpx(urls: List[str]) -> List[Dict[str, Any]]:
     """Crawl URLs using basic HTTP fetch with httpx or urllib."""
@@ -182,7 +179,6 @@ def _crawl_with_httpx(urls: List[str]) -> List[Dict[str, Any]]:
     
     return results
 
-
 def web_crawl(
     urls: Union[str, List[str]],
     provider: Optional[str] = None,
@@ -208,10 +204,47 @@ def web_crawl(
     single_url = isinstance(urls, str)
     if single_url and ',' in urls:
         # LLM may pass comma-separated URLs as a single string
-        url_list = [u.strip() for u in urls.split(',') if u.strip()]
-        single_url = len(url_list) == 1
+        raw_url_list = [u.strip() for u in urls.split(',') if u.strip()]
+        single_url = len(raw_url_list) == 1
     else:
-        url_list = [urls] if single_url else urls
+        raw_url_list = [urls] if single_url else urls
+
+    # Validate URLs to prevent SSRF and Local File Read
+    import urllib.parse
+    import socket
+    import ipaddress
+    
+    url_list = []
+    for u in raw_url_list:
+        try:
+            parsed = urllib.parse.urlparse(u)
+            if parsed.scheme not in ('http', 'https'):
+                logger.warning(f"Rejected non-http/https URL: {u}")
+                continue
+            hostname = parsed.hostname
+            if not hostname:
+                continue
+                
+            # Allow opting out of SSRF protection for advanced use cases
+            if os.environ.get("ALLOW_LOCAL_CRAWL") != "true":
+                try:
+                    ip_str = socket.gethostbyname(hostname)
+                    ip = ipaddress.ip_address(ip_str)
+                    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+                        logger.warning(f"Rejected SSRF or private IP attempt: {u}")
+                        continue
+                except socket.gaierror:
+                    logger.warning(f"Could not resolve hostname for: {u}")
+                    continue
+                
+            url_list.append(u)
+        except Exception as e:
+            logger.warning(f"URL validation failed for {u}: {e}")
+            continue
+            
+    if not url_list:
+        return {"error": "No valid or safe URLs provided. Local and non-http(s) URLs are blocked for security."}
+
     
     # Get available providers
     available = _get_available_crawl_providers()
@@ -237,10 +270,8 @@ def web_crawl(
     
     return results[0] if single_url else results
 
-
 # Alias for consistency with search_web naming
 crawl_web = web_crawl
-
 
 def get_available_crawl_providers() -> List[str]:
     """Get list of available crawl providers."""

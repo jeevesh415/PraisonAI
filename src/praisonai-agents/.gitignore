@@ -93,4 +93,6 @@ chroma_db/
 
 .praisonai
 .windsurf
-.agent
+.ruff_cache
+*.sfdx
+.sfdx/

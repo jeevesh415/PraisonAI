@@ -5,6 +5,8 @@ Manages registration and lookup of hooks for different events.
 """
 
 import logging
+import threading
+from praisonaiagents._logging import get_logger
 from typing import Dict, List, Optional, Callable, Union
 from functools import wraps
 
@@ -13,8 +15,7 @@ from .types import (
     HookInput, HookResult
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class HookRegistry:
     """
@@ -317,24 +318,23 @@ class HookRegistry:
     def __repr__(self) -> str:
         return f"HookRegistry(enabled={self._enabled}, hooks={len(self)})"
 
-
 # Global default registry
 _default_registry: Optional[HookRegistry] = None
-
+_default_registry_lock = threading.Lock()
 
 def get_default_registry() -> HookRegistry:
     """Get the default global hook registry."""
     global _default_registry
-    if _default_registry is None:
-        _default_registry = HookRegistry()
-    return _default_registry
-
+    with _default_registry_lock:
+        if _default_registry is None:
+            _default_registry = HookRegistry()
+        return _default_registry
 
 def set_default_registry(registry: HookRegistry):
     """Set the default global hook registry."""
     global _default_registry
-    _default_registry = registry
-
+    with _default_registry_lock:
+        _default_registry = registry
 
 # =============================================================================
 # Simplified API (beginner-friendly aliases)
@@ -400,7 +400,6 @@ def add_hook(
         matcher=matcher
     )
 
-
 def remove_hook(hook_id: str) -> bool:
     """Remove a hook by ID. Simplified API.
     
@@ -411,7 +410,6 @@ def remove_hook(hook_id: str) -> bool:
         True if hook was found and removed, False otherwise
     """
     return get_default_registry().unregister(hook_id)
-
 
 def has_hook(event: Union[str, HookEvent]) -> bool:
     """Check if any hooks are registered for an event. Simplified API.

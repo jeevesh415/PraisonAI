@@ -155,7 +155,7 @@ def _get_interactive_tools():
             from praisonai.cli.features.interactive_tools import get_interactive_tools, ToolConfig
             config = ToolConfig.from_env()
             config.workspace = os.environ.get("PRAISONAI_CODE_REPO_PATH", os.getcwd())
-            config.approval_mode = "auto"  # Trust mode - auto-approve all tool executions
+            # Do not hardcode approval_mode to "auto" to respect environment configuration
             tools = get_interactive_tools(config=config)
             _cached_modules['interactive_tools'] = tools
             _profile_end("load_interactive_tools")
@@ -193,10 +193,13 @@ def _ensure_env_loaded():
         _cached_modules['env_loaded'] = True
 
 # Auth secret setup (required early)
+import secrets
 CHAINLIT_AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET")
 if not CHAINLIT_AUTH_SECRET:
-    os.environ["CHAINLIT_AUTH_SECRET"] = "p8BPhQChpg@J>jBz$wGxqLX2V>yTVgP*7Ky9H$aV:axW~ANNX-7_T:o@lnyCBu^U"
-    CHAINLIT_AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET")
+    CHAINLIT_AUTH_SECRET = secrets.token_hex(32)
+    os.environ["CHAINLIT_AUTH_SECRET"] = CHAINLIT_AUTH_SECRET
+    logger.warning("CHAINLIT_AUTH_SECRET not set; generated a random secret for this session.")
+
 
 def save_setting(key: str, value: str):
     """Save a setting to the database"""

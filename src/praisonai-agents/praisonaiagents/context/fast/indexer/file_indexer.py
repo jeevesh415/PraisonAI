@@ -13,13 +13,13 @@ import fnmatch
 import hashlib
 import json
 import logging
+from praisonaiagents._logging import get_logger
 from dataclasses import dataclass
 from typing import Dict, List, Set, Optional, Any
 from pathlib import Path
 import time
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class FileInfo:
@@ -55,7 +55,6 @@ class FileInfo:
     def from_dict(cls, data: Dict[str, Any]) -> "FileInfo":
         """Create from dictionary."""
         return cls(**data)
-
 
 class FileIndexer:
     """Indexes files in a workspace for fast search.
@@ -197,7 +196,7 @@ class FileIndexer:
             return None
         
         try:
-            hasher = hashlib.md5()
+            hasher = hashlib.sha256()
             with open(filepath, 'rb') as f:
                 for chunk in iter(lambda: f.read(8192), b''):
                     hasher.update(chunk)

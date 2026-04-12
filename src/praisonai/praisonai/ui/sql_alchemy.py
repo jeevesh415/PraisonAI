@@ -77,9 +77,12 @@ class SQLAlchemyDataLayer(BaseDataLayer):
 
     ###### SQL Helpers ######
     async def execute_sql(
-        self, query: str, parameters: dict
+        self, query: str, parameters: dict, expand: Optional[str] = None
     ) -> Union[List[Dict[str, Any]], int, None]:
+        from sqlalchemy import bindparam
         parameterized_query = text(query)
+        if expand:
+            parameterized_query = parameterized_query.bindparams(bindparam(expand, expanding=True))
         async with self.async_session() as session:
             try:
                 await session.begin()
@@ -544,11 +547,11 @@ class SQLAlchemyDataLayer(BaseDataLayer):
         if not user_threads:
             return []
         else:
-            thread_ids = (
-                "('" + "','".join([t["thread_id"] for t in user_threads]) + "')"
-            )
+            # Build parameterized IN clause using expanding to prevent SQL injection
+            thread_id_list = [t["thread_id"] for t in user_threads]
+            tid_params = {"thread_ids": thread_id_list}
 
-        steps_feedbacks_query = f"""
+        steps_feedbacks_query = """
             SELECT
                 s."id" AS step_id,
                 s."name" AS step_name,
@@ -573,14 +576,14 @@ class SQLAlchemyDataLayer(BaseDataLayer):
                 f."comment" AS feedback_comment,
                 f."id" AS feedback_id
             FROM steps s LEFT JOIN feedbacks f ON s."id" = f."forId"
-            WHERE s."threadId" IN {thread_ids}
+            WHERE s."threadId" IN :thread_ids
             ORDER BY s."createdAt" ASC
         """
         steps_feedbacks = await self.execute_sql(
-            query=steps_feedbacks_query, parameters={}
+            query=steps_feedbacks_query, parameters=tid_params, expand="thread_ids"
         )
 
-        elements_query = f"""
+        elements_query = """
             SELECT
                 e."id" AS element_id,
                 e."threadId" as element_threadid,
@@ -596,9 +599,11 @@ class SQLAlchemyDataLayer(BaseDataLayer):
                 e."forId" AS element_forid,
                 e."mime" AS element_mime
             FROM elements e
-            WHERE e."threadId" IN {thread_ids}
+            WHERE e."threadId" IN :thread_ids
         """
-        elements = await self.execute_sql(query=elements_query, parameters={})
+        elements = await self.execute_sql(
+            query=elements_query, parameters=tid_params, expand="thread_ids"
+        )
 
         thread_dicts = {}
         for thread in user_threads:

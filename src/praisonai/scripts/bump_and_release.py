@@ -207,7 +207,7 @@ def validate_dependencies(max_retries: int = 3, retry_interval: int = 60, use_fr
     return False
 
 
-def release(version: str, use_frozen_lock: bool = False):
+def release(version: str, use_frozen_lock: bool = False, no_add_all: bool = False):
     """Run the release process."""
     root = get_project_root()
     praisonai_dir = get_praisonai_dir()
@@ -237,7 +237,34 @@ def release(version: str, use_frozen_lock: bool = False):
     
     # 4. Git add and commit
     print("\n📝 Committing changes...")
-    run(["git", "add", "-A"], cwd=root)
+    
+    release_files = [
+        "src/praisonai/praisonai/version.py",
+        "src/praisonai/praisonai/deploy.py",
+        "docker/Dockerfile", 
+        "docker/Dockerfile.chat",
+        "docker/Dockerfile.dev", 
+        "docker/Dockerfile.ui",
+        "src/praisonai/praisonai.rb",
+        "src/praisonai/pyproject.toml",
+        "src/praisonai/uv.lock",
+        "src/praisonai/README.md",
+        "src/praisonai-agents/pyproject.toml",
+        "src/praisonai-agents/uv.lock"
+    ]
+    
+    # Filter to only existing files to avoid git errors
+    files_to_add = []
+    for f in release_files:
+        if (root / f).exists():
+            files_to_add.append(f)
+            
+    if no_add_all:
+        print("  ℹ️  --no-add-all flag detected: Only explicitly modified release files will be staged.")
+        run(["git", "add"] + files_to_add, cwd=root)
+    else:
+        run(["git", "add", "-A"], cwd=root)
+        
     run(["git", "commit", "-m", f"Release {tag}"], cwd=root, check=False)
     
     # 5. Create git tag
@@ -324,6 +351,11 @@ Examples:
         action="store_true",
         help="Skip pre-flight checks (use with caution)"
     )
+    parser.add_argument(
+        "--no-add-all",
+        action="store_true",
+        help="Do NOT run 'git add -A'. Instead, only stage explicitly updated release files."
+    )
     
     args = parser.parse_args()
     
@@ -350,14 +382,18 @@ Examples:
         sys.exit(1)
     
     # Pre-flight checks
-    if not args.force:
-        print("\n🔍 Pre-flight checks...")
-        
-        # Check for uncommitted changes (warning only)
-        if check_git_status():
-            print("  ⚠️  Warning: You have uncommitted changes")
+    print("\n🔍 Pre-flight checks...")
+    
+    if check_git_status():
+        if args.no_add_all and not args.force:
+            print("  ❌ Error: Working directory has uncommitted changes.")
+            print("  💡 Stash or commit your feature changes before releasing, or use --force.")
+            sys.exit(1)
         else:
-            print("  ✅ Git working directory is clean")
+            print("  ⚠️  Warning: You have uncommitted changes. These WILL be included in the release commit by default.")
+            print("  💡 Use --no-add-all to prevent this.")
+    else:
+        print("  ✅ Git working directory is clean")
     
     # Wait for PyPI propagation if requested
     if args.wait and args.agents:
@@ -377,7 +413,7 @@ Examples:
         sys.exit(1)
     
     # Run release
-    release(args.version, use_frozen_lock=use_frozen)
+    release(args.version, use_frozen_lock=use_frozen, no_add_all=args.no_add_all)
 
 
 if __name__ == "__main__":

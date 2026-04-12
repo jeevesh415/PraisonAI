@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from pathlib import Path
 from enum import Enum
+import shlex
 import subprocess
 import logging
 import tempfile
@@ -85,7 +86,8 @@ class SandboxPolicy:
     # Command restrictions
     blocked_commands: Set[str] = field(default_factory=lambda: {
         "rm", "rmdir", "mv", "dd", "mkfs", "fdisk",
-        "sudo", "su", "chmod", "chown", "kill", "pkill"
+        "sudo", "su", "chmod", "chown", "kill", "pkill",
+        "sh", "bash", "dash", "zsh", "csh", "ksh"
     })
     
     @classmethod
@@ -112,7 +114,8 @@ class SandboxPolicy:
                 blocked_commands={
                     "rm", "rmdir", "mv", "dd", "mkfs", "fdisk",
                     "sudo", "su", "chmod", "chown", "kill", "pkill",
-                    "curl", "wget", "nc", "netcat", "ssh", "scp"
+                    "curl", "wget", "nc", "netcat", "ssh", "scp",
+                    "sh", "bash", "dash", "zsh", "csh", "ksh"
                 }
             )
         
@@ -324,8 +327,8 @@ class SubprocessSandbox:
         # Execute
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                shlex.split(command),
+                shell=False,
                 cwd=cwd,
                 env=env,
                 capture_output=capture_output,
@@ -377,10 +380,25 @@ class SubprocessSandbox:
         """Execute without sandbox (when disabled)."""
         start_time = time.time()
         
+        # Block dangerous shell injection characters when using shell=True
+        banned_chars = [';', '&', '|', '$', '`']
+        if any(char in command for char in banned_chars):
+            return ExecutionResult(
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr="Command contains blocked shell characters",
+                duration_ms=(time.time() - start_time) * 1000,
+                was_sandboxed=False,
+                policy_violations=["Command contains blocked shell characters"]
+            )
+            
         try:
+            # Use shell=False with shlex.split for safer execution
+            args = shlex.split(command)
             result = subprocess.run(
-                command,
-                shell=True,
+                args,
+                shell=False,  # Use shell=False for security
                 cwd=self.working_dir,
                 capture_output=capture_output,
                 text=True,

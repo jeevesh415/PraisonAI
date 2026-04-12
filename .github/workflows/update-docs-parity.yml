@@ -27,11 +27,13 @@ jobs:
         fetch-depth: 0
 
     - name: Checkout PraisonAIDocs
+      id: checkout_docs
+      continue-on-error: true
       uses: actions/checkout@v4
       with:
         repository: MervinPraison/PraisonAIDocs
         path: PraisonAIDocs
-        token: ${{ secrets.DOCS_PAT }}
+        token: ${{ secrets.SECRETS_ADMIN_PAT }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -43,6 +45,7 @@ jobs:
         pip install pyyaml
 
     - name: Generate docs parity trackers
+      if: steps.checkout_docs.outcome == 'success'
       run: |
         cd $GITHUB_WORKSPACE
         python3 src/praisonai/scripts/generate_docs_parity.py --docs-root PraisonAIDocs/docs --copy-docs
@@ -65,16 +68,16 @@ jobs:
       with:
         commit_message: "docs: auto-update documentation parity trackers [skip ci]"
         file_pattern: 'src/praisonai-agents/DOCS_PARITY.md src/praisonai-ts/DOCS_PARITY.md src/praisonai-rust/DOCS_PARITY.md'
-        commit_user_name: "github-actions[bot]"
-        commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
-        commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+        commit_user_name: "MervinPraison"
+        commit_user_email: "454862+MervinPraison@users.noreply.github.com"
+        commit_author: "MervinPraison <454862+MervinPraison@users.noreply.github.com>"
 
     - name: Commit and push changes to PraisonAIDocs
-      if: steps.check_changes.outputs.changes == 'true'
+      if: steps.check_changes.outputs.changes == 'true' && steps.checkout_docs.outcome == 'success'
       run: |
         cd PraisonAIDocs
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config user.name "MervinPraison"
+        git config user.email "454862+MervinPraison@users.noreply.github.com"
         git add docs/features/DOCS_PARITY.md docs/js/DOCS_PARITY.md docs/rust/DOCS_PARITY.md
         git diff --staged --quiet || git commit -m "docs: auto-update documentation parity trackers [skip ci]"
         git push

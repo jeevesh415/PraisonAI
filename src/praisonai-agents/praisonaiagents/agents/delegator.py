@@ -6,15 +6,16 @@ and context. Inspired by Gemini CLI's delegate-to-agent pattern.
 """
 
 import logging
+from praisonaiagents._logging import get_logger
 import asyncio
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable
 from enum import Enum
 
 from .profiles import AgentProfile, AgentMode, get_profile, BUILTIN_PROFILES
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class DelegationStatus(Enum):
     """Status of a delegated task."""
@@ -24,7 +25,6 @@ class DelegationStatus(Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMEOUT = "timeout"
-
 
 @dataclass
 class DelegationConfig:
@@ -48,7 +48,6 @@ class DelegationConfig:
     # Behavior
     auto_cancel_on_parent_cancel: bool = True
     collect_results: bool = True
-
 
 @dataclass
 class DelegationTask:
@@ -75,7 +74,6 @@ class DelegationTask:
     # Metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-
 @dataclass
 class DelegationResult:
     """Result of a delegation operation."""
@@ -87,7 +85,6 @@ class DelegationResult:
     steps_taken: int = 0
     tokens_used: int = 0
     duration_seconds: float = 0.0
-
 
 class SubagentDelegator:
     """
@@ -131,6 +128,12 @@ class SubagentDelegator:
             agent_factory: Factory function to create agents
             on_task_complete: Callback when task completes
         """
+        warnings.warn(
+            "SubagentDelegator is deprecated. Use Agent.handoff_to() or "
+            "parallel_handoffs() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config or DelegationConfig()
         self.agent_factory = agent_factory
         self.on_task_complete = on_task_complete
@@ -447,7 +450,6 @@ class SubagentDelegator:
         """Generate a unique task ID."""
         self._task_counter += 1
         return f"task_{self._task_counter}"
-
 
 # Convenience function for quick delegation
 async def delegate_to_agent(

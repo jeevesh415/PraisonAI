@@ -19,12 +19,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+from praisonaiagents._logging import get_logger
 import os
 from typing import Dict, List, Optional, Set
 
 from .protocols import ApprovalDecision, ApprovalRequest
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Default dangerous tools — same as old approval.py
 DEFAULT_DANGEROUS_TOOLS: Dict[str, str] = {
@@ -45,6 +46,18 @@ DEFAULT_DANGEROUS_TOOLS: Dict[str, str] = {
     "scrape_page": "medium",
 }
 
+# Permission presets — resolved to deny frozensets at Agent.__init__ time.
+# Usage: Agent(approval="safe")
+PERMISSION_PRESETS = {
+    # "safe" — blocks all dangerous tools (file writes, shell exec, etc.)
+    "safe": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()),
+    # "read_only" — blocks dangerous tools + write operations
+    "read_only": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()) | frozenset({
+        "write_file", "copy_file", "move_file",
+    }),
+    # "full" — no restrictions
+    "full": frozenset(),
+}
 
 class ApprovalRegistry:
     """Per-agent approval configuration.
@@ -134,6 +147,8 @@ class ApprovalRegistry:
         self._approved_context.set(approved)
 
     def is_already_approved(self, tool_name: str) -> bool:
+        if self.get_risk_level(tool_name) == "critical":
+            return False
         return tool_name in self._approved_context.get(set())
 
     def clear_approved(self) -> None:
@@ -197,15 +212,12 @@ class ApprovalRegistry:
         if hasattr(backend, "request_approval_sync"):
             decision = backend.request_approval_sync(request)
         else:
-            # Fallback: run async method
-            try:
-                decision = asyncio.run(backend.request_approval(request))
-            except RuntimeError:
-                # Already in an event loop — fall back to thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, backend.request_approval(request))
-                    decision = future.result(timeout=self.timeout)
+            # Use shared utility for consistent async-to-sync bridging
+            from .utils import run_coroutine_safely
+            decision = run_coroutine_safely(
+                backend.request_approval(request),
+                timeout=self.timeout
+            )
 
         if decision.approved:
             self.mark_approved(tool_name)

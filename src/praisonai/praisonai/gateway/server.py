@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -42,6 +43,10 @@ class GatewaySession:
     _state: Dict[str, Any] = field(default_factory=dict)
     _messages: List[GatewayMessage] = field(default_factory=list)
     _max_messages: int = 1000
+    
+    # Stepper & Concurrency logic
+    _inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _is_executing: bool = False
     
     @property
     def session_id(self) -> str:
@@ -87,6 +92,20 @@ class GatewaySession:
     
     def close(self) -> None:
         self._is_active = False
+
+    async def queue_message(self, message: str) -> None:
+        """Queue a user message for execution after the current operation."""
+        await self._inbox.put(message)
+        
+    def get_next_message(self) -> Optional[str]:
+        """Fetch the next queued message if available without blocking."""
+        if self._inbox.empty():
+            return None
+        return self._inbox.get_nowait()
+        
+    def mark_executing(self, status: bool) -> None:
+        """Mark the session as currently executing an agent workflow."""
+        self._is_executing = status
 
 
 class WebSocketGateway:
@@ -183,6 +202,14 @@ class WebSocketGateway:
             config: Optional gateway configuration
         """
         self.config = config or GatewayConfig(host=host, port=port)
+        if hasattr(self.config, 'auth_token') and not self.config.auth_token:
+            import secrets
+            self.config.auth_token = secrets.token_hex(16)
+            logger.warning(
+                f"No auth_token provided for Gateway server. Generated temporary token: {self.config.auth_token}. "
+                "For production, set GATEWAY_AUTH_TOKEN."
+            )
+        
         self._host = self.config.host
         self._port = self.config.port
         
@@ -239,7 +266,29 @@ class WebSocketGateway:
         async def health(request):
             return JSONResponse(self.health())
         
+        def _check_auth(request) -> Optional[JSONResponse]:
+            """Validate auth token if configured. Returns error response or None."""
+            if not self.config.auth_token:
+                return None
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "Authentication required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            token = auth_header[7:]
+            if not secrets.compare_digest(token, self.config.auth_token):
+                return JSONResponse(
+                    {"error": "Invalid authentication token"},
+                    status_code=403,
+                )
+            return None
+        
         async def info(request):
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
             return JSONResponse({
                 "name": "PraisonAI Gateway",
                 "version": "1.0.0",
@@ -249,6 +298,13 @@ class WebSocketGateway:
             })
         
         async def websocket_endpoint(websocket: WebSocket):
+            # Authenticate WebSocket via query param or first message
+            if self.config.auth_token:
+                ws_token = websocket.query_params.get("token", "")
+                if not secrets.compare_digest(ws_token, self.config.auth_token):
+                    await websocket.close(code=4003, reason="Authentication required")
+                    return
+            
             await websocket.accept()
             client_id = str(uuid.uuid4())
             self._clients[client_id] = websocket
@@ -281,9 +337,137 @@ class WebSocketGateway:
                     source=client_id,
                 ))
         
+        # ── Approval endpoints ─────────────────────────────────────────
+        # Lazy-import approval machinery so it doesn't slow down startup
+        # or fail if optional deps are missing.
+        from .exec_approval import Resolution, get_exec_approval_manager
+        from .rate_limiter import AuthRateLimiter
+
+        _approval_mgr = get_exec_approval_manager()
+        _approval_rate = AuthRateLimiter(max_attempts=10, window_seconds=60)
+
+        async def approval_pending(request):
+            """GET /api/approval/pending — list pending approval requests."""
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            client_ip = request.client.host if request.client else "unknown"
+            if not _approval_rate.allow("approval_pending", client_ip):
+                retry = _approval_rate.time_until_allowed("approval_pending", client_ip)
+                return JSONResponse(
+                    {"error": "Rate limited", "retry_after_seconds": round(retry)},
+                    status_code=429,
+                )
+
+            return JSONResponse({
+                "pending": _approval_mgr.list_pending(),
+                "allow_list": _approval_mgr.allowlist.list(),
+            })
+
+        async def approval_resolve(request):
+            """POST /api/approval/resolve — approve or deny a tool request.
+
+            Body: {"request_id": "...", "approved": true/false,
+                   "reason": "...", "allow_always": false}
+            """
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            client_ip = request.client.host if request.client else "unknown"
+            if not _approval_rate.allow("approval_resolve", client_ip):
+                retry = _approval_rate.time_until_allowed("approval_resolve", client_ip)
+                return JSONResponse(
+                    {"error": "Rate limited", "retry_after_seconds": round(retry)},
+                    status_code=429,
+                )
+
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+            request_id = body.get("request_id", "")
+            if not request_id:
+                return JSONResponse(
+                    {"error": "request_id is required"}, status_code=400,
+                )
+
+            resolution = Resolution(
+                approved=bool(body.get("approved", False)),
+                reason=str(body.get("reason", "")),
+                allow_always=bool(body.get("allow_always", False)),
+            )
+
+            found = _approval_mgr.resolve(request_id, resolution)
+            if not found:
+                return JSONResponse(
+                    {"error": "Request not found or already resolved"},
+                    status_code=404,
+                )
+
+            return JSONResponse({
+                "resolved": True,
+                "request_id": request_id,
+                "approved": resolution.approved,
+            })
+
+        async def approval_allowlist(request):
+            """GET/POST/DELETE /api/approval/allow-list
+
+            GET    → list allow-listed tools
+            POST   → add a tool: {"tool_name": "..."}
+            DELETE → remove a tool: {"tool_name": "..."}
+            """
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            client_ip = request.client.host if request.client else "unknown"
+            if not _approval_rate.allow("approval_allowlist", client_ip):
+                retry = _approval_rate.time_until_allowed("approval_allowlist", client_ip)
+                return JSONResponse(
+                    {"error": "Rate limited", "retry_after_seconds": round(retry)},
+                    status_code=429,
+                )
+
+            if request.method == "GET":
+                return JSONResponse({
+                    "allow_list": _approval_mgr.allowlist.list(),
+                })
+
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+            tool_name = body.get("tool_name", "")
+            if not tool_name:
+                return JSONResponse(
+                    {"error": "tool_name is required"}, status_code=400,
+                )
+
+            if request.method == "POST":
+                _approval_mgr.allowlist.add(tool_name)
+                return JSONResponse({"added": tool_name})
+            elif request.method == "DELETE":
+                removed = _approval_mgr.allowlist.remove(tool_name)
+                if not removed:
+                    return JSONResponse(
+                        {"error": f"'{tool_name}' not in allow-list"},
+                        status_code=404,
+                    )
+                return JSONResponse({"removed": tool_name})
+
+            return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
         routes = [
             Route("/health", health, methods=["GET"]),
             Route("/info", info, methods=["GET"]),
+            Route("/api/approval/pending", approval_pending, methods=["GET"]),
+            Route("/api/approval/resolve", approval_resolve, methods=["POST"]),
+            Route("/api/approval/allow-list", approval_allowlist, methods=["GET", "POST", "DELETE"]),
             WebSocketRoute("/ws", websocket_endpoint),
         ]
         
@@ -399,40 +583,72 @@ class WebSocketGateway:
             return "Agent not available"
         
         client_id = session.client_id
+        content = message.content if isinstance(message.content, str) else str(message.content)
         
-        try:
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            
-            # Wire streaming relay if agent has a stream_emitter
-            relay_callback = None
-            emitter = getattr(agent, 'stream_emitter', None)
-            if emitter is not None and client_id:
-                relay_callback = self._make_stream_relay(client_id, session)
-                emitter.add_callback(relay_callback)
-            
-            try:
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(None, agent.chat, content)
-            finally:
-                # Always clean up the relay callback
-                if relay_callback and emitter is not None:
-                    try:
-                        emitter.remove_callback(relay_callback)
-                    except (ValueError, AttributeError):
-                        pass
-            
-            response_message = GatewayMessage(
-                content=response,
-                sender_id=session.agent_id,
-                session_id=session.session_id,
-                reply_to=message.message_id,
+        # Inbox & Stepper logic
+        if session._is_executing:
+            # Send an ephemeral status event
+            await self._send_to_client(
+                client_id,
+                {
+                    "type": "status",
+                    "source": session.agent_id,
+                    "message": "Thinking... (I've added your new message to the queue to process next)."
+                }
             )
-            session.add_message(response_message)
+            await session.queue_message(content)
+            return "Message queued."
             
-            return response
-        except Exception as e:
-            logger.error(f"Agent error: {e}")
-            return f"Error: {str(e)}"
+        session.mark_executing(True)
+        await session.queue_message(content)
+        
+        # Start background task to process the queue
+        asyncio.create_task(self._run_session_queue(session, agent, client_id))
+        return "Started processing."
+
+    async def _run_session_queue(self, session: GatewaySession, agent: Any, client_id: str) -> None:
+        """Background task loop that constantly pulls from `_inbox` and executes the agent task."""
+        try:
+            while True:
+                content = session.get_next_message()
+                if not content:
+                    break  # Queue is empty, exit loop
+                
+                # Wire streaming relay if agent has a stream_emitter
+                relay_callback = None
+                emitter = getattr(agent, 'stream_emitter', None)
+                if emitter is not None and client_id:
+                    relay_callback = self._make_stream_relay(client_id, session)
+                    emitter.add_callback(relay_callback)
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(None, agent.chat, content)
+                except Exception as e:
+                    logger.error(f"Agent error in queue processor: {e}")
+                    response = f"Error: {str(e)}"
+                finally:
+                    # Always clean up the relay callback
+                    if relay_callback and emitter is not None:
+                        try:
+                            emitter.remove_callback(relay_callback)
+                        except (ValueError, AttributeError):
+                            pass
+                
+                response_message = GatewayMessage(
+                    content=response,
+                    sender_id=session.agent_id,
+                    session_id=session.session_id,
+                )
+                session.add_message(response_message)
+                
+                await self._send_to_client(client_id, {
+                    "type": "response",
+                    "content": response,
+                    "session_id": session.session_id,
+                })
+        finally:
+            session.mark_executing(False)
 
     def _make_stream_relay(
         self, client_id: str, session: "GatewaySession"

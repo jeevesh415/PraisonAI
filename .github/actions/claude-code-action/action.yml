@@ -5,6 +5,9 @@ inputs:
   anthropic_api_key:
     description: "Anthropic API key"
     required: false
+  claude_code_oauth_token:
+    description: "Claude Code OAuth Token for Claude Pro"
+    required: false
   github_token:
     description: "GitHub token for Claude to operate with"
     required: false
@@ -67,6 +70,8 @@ runs:
 
     - name: Install GitHub MCP Server
       shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
       run: |
         claude mcp add-json github '{
           "command": "docker",
@@ -79,7 +84,7 @@ runs:
             "ghcr.io/github/github-mcp-server:sha-ff3036d"
           ],
           "env": {
-            "GITHUB_PERSONAL_ACCESS_TOKEN": "${{ inputs.github_token }}"
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "'"${INPUT_GITHUB_TOKEN}"'"
           }
         }'
 
@@ -204,14 +209,44 @@ runs:
         User Request:
         $USER_REQUEST
         
-        Please analyze the request and provide helpful assistance. You have access to repository tools and can help with:
-        - Code analysis and implementation
-        - GitHub workflows and automation
-        - Pull request reviews and feedback
-        - Issue resolution and bug fixes
-        - Documentation updates
-        - Testing and deployment
-        
+        Please analyze the request and provide helpful assistance.
+
+        CRITICAL INSTRUCTION: If your task involves modifying codebase files to add a feature or fix a bug:
+
+        STEP 0 — SETUP GIT IDENTITY:
+        git config user.name "MervinPraison"
+        git config user.email "454862+MervinPraison@users.noreply.github.com"
+
+        STEP 1 — READ GUIDELINES:
+        MANDATORY: Before writing any code, you MUST carefully read "src/praisonai-agents/AGENTS.md" to understand this repository's extremely specific Architecture, Protocol-First design rules, and Agent-Centric Philosophy.
+
+        STEP 2 — ARCHITECTURE VALIDATION & ROUTING (MANDATORY before writing code):
+        Before implementing anything, answer these questions:
+        - CORE vs WRAPPER vs TOOLS ROUTING:
+          1. Core SDK (praisonaiagents/): Only core protocols, base classes, decorators. No heavy implementations.
+          2. Wrapper (praisonai/): CLI, heavy implementations, optional dependencies.
+          3. Tools (PraisonAI-Tools): Specific integrations, external tools (e.g. SurrealDB, Slack), and community extensions MUST go to the `MervinPraison/PraisonAI-Tools` repository. If the feature is a tool, clone `https://github.com/MervinPraison/PraisonAI-Tools`, implement it there, and create the PR using `gh pr create -R MervinPraison/PraisonAI-Tools`.
+        - Does it duplicate existing functionality? Check if Agent already supports this via existing params (reflection, planning, tools, hooks, memory).
+        - Does it inherit from Agent properly? New agent types MUST inherit Agent, not wrap it with composition.
+        - Does it add new dependencies? Only optional deps allowed, must be lazy-imported.
+        - Will agent.py grow larger? If the change adds >50 lines to agent.py, find a way to extract instead.
+        - Is there a name collision with existing exports in __init__.py?
+        If ANY of these conceptual checks fail (excluding routing), add a comment to the issue explaining why and close it. Do NOT create a PR.
+
+        STEP 3 — IMPLEMENT:
+        - Create a new git branch appropriately named (e.g. \`feature/issue-<number>\`)
+        - Follow protocol-driven design: protocols in core SDK, heavy implementations in wrapper
+        - Keep changes small and backward-compatible
+
+        STEP 4 — TEST:
+        - Run: cd src/praisonai-agents && PYTHONPATH=. python -m pytest tests/ -x -q --timeout=30
+        - Ensure no regressions
+
+        STEP 5 — CREATE PR:
+        - Commit with descriptive message, push the branch
+        - Use the GitHub CLI (\`gh pr create --title "..." --body "Fixes #<number>"\`) to open a Pull Request
+        CRITICAL: You MUST create the PR automatically using \`gh pr create\`. Do NOT just provide a link.
+
         Respond naturally and helpfully to the user's request using the available tools.
         EOF
         
@@ -221,6 +256,14 @@ runs:
     - name: Run Claude Code
       if: env.SKIP_EXECUTION != 'true'
       shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_MAX_TURNS: ${{ inputs.max_turns }}
+        INPUT_ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+        INPUT_DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
       run: |
         echo "🚀 Running Claude Code with GitHub context..."
         
@@ -228,29 +271,26 @@ runs:
         CMD_ARGS=("-p" "--verbose" "--output-format" "stream-json")
         
         # Add max turns if specified
-        if [[ -n "${{ inputs.max_turns }}" ]]; then
-          CMD_ARGS+=("--max-turns" "${{ inputs.max_turns }}")
+        if [[ -n "$INPUT_MAX_TURNS" ]]; then
+          CMD_ARGS+=("--max-turns" "$INPUT_MAX_TURNS")
         fi
         
         # Add allowed tools (include GitHub tools by default)
         TOOLS="mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__update_issue,mcp__github__search_issues,mcp__github__list_issues,mcp__github__create_comment,Read,Write,Edit,Bash"
-        if [[ -n "${{ inputs.allowed_tools }}" ]]; then
-          TOOLS="$TOOLS,${{ inputs.allowed_tools }}"
+        if [[ -n "$INPUT_ALLOWED_TOOLS" ]]; then
+          TOOLS="$TOOLS,$INPUT_ALLOWED_TOOLS"
         fi
         CMD_ARGS+=("--allowedTools" "$TOOLS")
         
         # Add disallowed tools
-        if [[ -n "${{ inputs.disallowed_tools }}" ]]; then
-          CMD_ARGS+=("--disallowedTools" "${{ inputs.disallowed_tools }}")
+        if [[ -n "$INPUT_DISALLOWED_TOOLS" ]]; then
+          CMD_ARGS+=("--disallowedTools" "$INPUT_DISALLOWED_TOOLS")
         fi
         
         echo "📝 Executing Claude Code with prompt from file..."
         
         # Execute Claude Code with timeout, using stdin for the prompt
-        TIMEOUT_SECONDS=$((${{ inputs.timeout_minutes }} * 60))
-        timeout $TIMEOUT_SECONDS claude "${CMD_ARGS[@]}" < "${{ env.PROMPT_FILE }}"
+        TIMEOUT_SECONDS=$(($INPUT_TIMEOUT_MINUTES * 60))
+        timeout $TIMEOUT_SECONDS claude "${CMD_ARGS[@]}" < "$PROMPT_FILE"
         
-        echo "✅ Claude Code execution completed"
-      env:
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
-        GITHUB_TOKEN: ${{ inputs.github_token }} 
+        echo "✅ Claude Code execution completed" 

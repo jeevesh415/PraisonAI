@@ -3,8 +3,16 @@ name: Windows Tests
 on:
   push:
     branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'pyproject.toml'
+      - '.github/workflows/test-windows.yml'
   pull_request:
     branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'pyproject.toml'
+      - '.github/workflows/test-windows.yml'
   workflow_dispatch:
 
 jobs:
@@ -14,10 +22,12 @@ jobs:
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL_NAME: gpt-4o-mini
+      PYTHONUTF8: 1
     
     steps:
     - uses: actions/checkout@v4
-    
+        with:
+          persist-credentials: false
     - name: Set up Python 3.11
       uses: actions/setup-python@v5
       with:
@@ -27,13 +37,13 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         cd src/praisonai-agents
-        pip install .
+        pip install -e .
       shell: bash
     
     - name: Install praisonai wrapper
       run: |
         cd src/praisonai
-        pip install .[dev]
+        pip install -e .
       shell: bash
 
     # ==================== CORE IMPORTS ====================
@@ -41,7 +51,7 @@ jobs:
       run: |
         python -c "from praisonaiagents import Agent, Agents, Workflow; print('Core imports OK')"
         python -c "from praisonaiagents import tool, Tools; print('Tool imports OK')"
-        python -c "from praisonaiagents import Task, WorkflowStep; print('Task/Step imports OK')"
+        python -c "from praisonaiagents import Task; print('Task imports OK')"
 
     # ==================== AGENT FEATURES ====================
     - name: Test Agent instantiation
@@ -66,21 +76,13 @@ jobs:
         "
 
     # ==================== WORKFLOW FEATURES ====================
-    - name: Test Workflow and WorkflowStep
+    - name: Test Workflow
       run: |
         python -c "
-        from praisonaiagents import Workflow, WorkflowStep
-        from praisonaiagents.workflows import WorkflowOutputConfig
+        from praisonaiagents import Workflow
         
         w = Workflow(name='test')
-        s1 = WorkflowStep(name='step1')
-        s2 = WorkflowStep(name='step2', context=['step1'])
         print('Workflow:', w.name)
-        print('Steps:', s1.name, s2.name)
-        
-        cfg = WorkflowOutputConfig(verbose=True, stream=False)
-        w2 = Workflow(name='configured', output=cfg)
-        print('Configured workflow verbose:', w2.verbose)
         "
 
     # ==================== MEMORY FEATURES ====================

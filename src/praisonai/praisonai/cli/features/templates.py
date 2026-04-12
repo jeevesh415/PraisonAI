@@ -592,7 +592,7 @@ class TemplatesHandler:
             # Run workflow - determine which class to use based on config structure
             if "agents" in workflow_config and "tasks" in workflow_config:
                 # Agents format (agents + tasks)
-                from praisonaiagents import Agent, Task, Agents
+                from praisonaiagents import Agent, Task, AgentTeam
                 
                 # Build agents
                 agents_config = workflow_config.get("agents", [])
@@ -847,8 +847,14 @@ class TemplatesHandler:
                     zip_path = Path(tmpdir) / "repo.zip"
                     urllib.request.urlretrieve(zip_url, zip_path)
                     
-                    # Extract
+                    # Extract safely, preventing Zip Slip
                     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        import os
+                        tmpdir_real = os.path.realpath(tmpdir)
+                        for zip_info in zip_ref.infolist():
+                            extracted_path = os.path.realpath(os.path.join(tmpdir_real, zip_info.filename))
+                            if not extracted_path.startswith(tmpdir_real):
+                                raise Exception(f"Attempted Zip Slip vulnerabilities detected: {zip_info.filename}")
                         zip_ref.extractall(tmpdir)
                     
                     # Find the template

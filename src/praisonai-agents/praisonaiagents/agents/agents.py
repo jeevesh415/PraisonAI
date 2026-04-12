@@ -2,8 +2,8 @@ import os
 import time
 import json
 import logging
+from praisonaiagents._logging import get_logger
 from typing import Any, Dict, Optional, List
-from rich.console import Console
 from ..main import display_error, TaskOutput
 from ..agent.agent import Agent
 from ..task.task import Task
@@ -28,9 +28,11 @@ class TaskStatus(Enum):
     UNKNOWN = "unknown"
 
 # Set up logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# Global variables for managing the shared servers
+# Global variables for managing the shared servers with thread-safety
+import threading
+_agents_server_lock = threading.Lock()  # Protect all global server state mutations
 _agents_server_started = {}  # Dict of port -> started boolean
 _agents_registered_endpoints = {}  # Dict of port -> Dict of path -> endpoint_id
 _agents_shared_apps = {}  # Dict of port -> FastAPI app
@@ -61,7 +63,6 @@ def process_video(video_path: str, seconds_per_frame=2):
         curr_frame += frames_to_skip
     video.release()
     return base64_frames
-
 
 def get_multimodal_message(text_prompt: str, images: list) -> list:
     """
@@ -107,6 +108,243 @@ def get_multimodal_message(text_prompt: str, images: list) -> list:
             })
     return content
 
+def _prepare_task_prompt(task, task_description, context_text=None):
+    """
+    Prepare task prompt with context and memory (DRY helper).
+    """
+    # Build task prompt - only use "User Input/Topic" format if there's actual content
+    if context_text and context_text.strip():
+        task_prompt = f"""
+User Input/Topic: {context_text}
+
+Task: {task_description}
+Expected Output: {task.expected_output}
+
+IMPORTANT: Your response must be about the user's input/topic above. Incorporate it into your task."""
+    else:
+        task_prompt = f"""
+You need to do the following task: {task_description}.
+Expected Output: {task.expected_output}."""
+
+    # Add memory context if available
+    if task.memory:
+        try:
+            memory_context = task.memory.build_context_for_task(task.description)
+            if memory_context:
+                # Log detailed memory context for debugging
+                logger.debug(f"Memory context for task '{task.description}': {memory_context}")
+                # Include actual memory content without verbose headers (essential for AI agent functionality)
+                task_prompt += f"\n\n{memory_context}"
+        except Exception as e:
+            logger.error(f"Error getting memory context: {e}")
+
+    task_prompt += "\nPlease provide only the final result of your work. Do not add any conversation or extra explanation."
+    return task_prompt
+
+def _execute_with_agent_sync(executor_agent, task_prompt, task, tools, stream=None):
+    """
+    Execute task with agent synchronously (DRY helper).
+    """
+    if task.images:
+        return executor_agent.chat(
+            get_multimodal_message(task_prompt, task.images),
+            tools=tools,
+            output_json=task.output_json,
+            output_pydantic=task.output_pydantic,
+            stream=stream,
+            task_name=task.name,
+            task_description=task.description,
+            task_id=task.id
+        )
+    else:
+        return executor_agent.chat(
+            task_prompt,
+            tools=tools,
+            output_json=task.output_json,
+            output_pydantic=task.output_pydantic,
+            stream=stream,
+            task_name=task.name,
+            task_description=task.description,
+            task_id=task.id
+        )
+
+async def _execute_with_agent_async(executor_agent, task_prompt, task, tools, stream=None):
+    """
+    Execute task with agent asynchronously (DRY helper).
+    """
+    if task.images:
+        return await executor_agent.achat(
+            get_multimodal_message(task_prompt, task.images),
+            tools=tools,
+            output_json=task.output_json,
+            output_pydantic=task.output_pydantic,
+            stream=stream,
+            task_name=task.name,
+            task_description=task.description,
+            task_id=task.id
+        )
+    else:
+        return await executor_agent.achat(
+            task_prompt,
+            tools=tools,
+            output_json=task.output_json,
+            output_pydantic=task.output_pydantic,
+            stream=stream,
+            task_name=task.name,
+            task_description=task.description,
+            task_id=task.id
+        )
+
+
+def _build_execution_context(agents_instance, task_id):
+    """
+    Build unified execution context for task execution (DRY helper).
+    Eliminates duplication between sync/async execution paths.
+    """
+    from .protocols import ExecutionContext
+    
+    task = agents_instance.tasks[task_id]
+    
+    # Initialize memory before task execution
+    if not task.memory:
+        task.memory = task.initialize_memory()
+
+    executor_agent = task.agent
+    
+    # Create agent from agent_config if provided and no agent assigned
+    if executor_agent is None and getattr(task, 'agent_config', None):
+        executor_agent = agents_instance._create_agent_from_config(task.agent_config)
+        task.agent = executor_agent
+    
+    # Validate executor agent exists
+    if executor_agent is None:
+        raise ValueError(
+            f"Task {task_id} has no assigned agent. "
+            "Set task.agent or provide task.agent_config before execution."
+        )
+    
+    # Set current agent for token tracking
+    llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
+    if llm and hasattr(llm, 'set_current_agent'):
+        llm.set_current_agent(executor_agent.display_name)
+
+    # Ensure tools are available from both task and agent (create copy to avoid mutation)
+    tools = list(task.tools or [])
+    if executor_agent and executor_agent.tools:
+        tools.extend(executor_agent.tools)
+
+    # Substitute variables in task description if provided
+    task_description = task.description
+    variables = getattr(task, 'variables', None) or getattr(agents_instance, 'variables', None) or {}
+    for key, value in variables.items():
+        task_description = task_description.replace(f"{{{{{key}}}}}", str(value))
+
+    # Build context first to include in task prompt
+    context_text = ""
+    if task.context:
+        context_results = []  # Collect contexts then de-duplicate
+        for context_item in task.context:
+            # Use the centralized helper function
+            context_str = process_task_context(context_item, agents_instance.verbose, agents_instance.user_id)
+            # Only add non-empty context strings
+            if context_str and context_str.strip():
+                context_results.append(context_str)
+        
+        # Join unique context results with proper formatting
+        unique_contexts = list(dict.fromkeys(context_results))  # Remove duplicates
+        if agents_instance.verbose >= 3:
+            logger.info(f"Task {task_id} context items: {len(unique_contexts)}")
+            for i, ctx in enumerate(unique_contexts):
+                logger.debug(f"Context {i+1}: {ctx[:100]}...")
+        context_separator = '\n\n'
+        context_text = context_separator.join(unique_contexts)
+    
+    # Build task prompt using DRY helper
+    task_prompt = _prepare_task_prompt(task, task_description, context_text)
+
+    if agents_instance.verbose >= 2:
+        logger.info(f"Executing task {task_id}: {task_description} using {executor_agent.display_name}")
+    logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
+
+    return ExecutionContext(
+        task_id=task_id,
+        task=task,
+        executor_agent=executor_agent,
+        tools=tools,
+        task_description=task_description,
+        context_text=context_text,
+        task_prompt=task_prompt,
+        llm=llm,
+        verbose=agents_instance.verbose,
+        stream=agents_instance.stream,
+        user_id=agents_instance.user_id
+    )
+
+
+def _process_task_result(agents_instance, context, agent_output):
+    """
+    Process task execution result (DRY helper).
+    Eliminates duplication in result processing between sync/async paths.
+    """
+    from .protocols import TaskResult
+    
+    task = context.task
+    task_id = context.task_id
+    executor_agent = context.executor_agent
+    llm = context.llm
+    
+    if agent_output:
+        # Store the response in memory
+        if task.memory:
+            try:
+                task.store_in_memory(
+                    content=agent_output,
+                    agent_name=executor_agent.display_name,
+                    task_id=task_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to store agent output in memory: {e}")
+
+        task_output = TaskOutput(
+            description=task.description,
+            summary=task.description[:10],
+            raw=agent_output,
+            agent=executor_agent.display_name,
+            output_format="RAW"
+        )
+        
+        # Add token metrics if available
+        if llm and hasattr(llm, 'last_token_metrics'):
+            token_metrics = llm.last_token_metrics
+            if token_metrics:
+                task_output.token_metrics = token_metrics
+
+        if task.output_json:
+            cleaned = agents_instance.clean_json_output(agent_output)
+            try:
+                parsed = json.loads(cleaned)
+                task_output.json_dict = parsed
+                task_output.output_format = "JSON"
+            except Exception:
+                logger.warning(f"Warning: Could not parse output of task {task_id} as JSON")
+                logger.debug(f"Output that failed JSON parsing: {agent_output}")
+
+        if task.output_pydantic:
+            cleaned = agents_instance.clean_json_output(agent_output)
+            try:
+                parsed = json.loads(cleaned)
+                pyd_obj = task.output_pydantic(**parsed)
+                task_output.pydantic = pyd_obj
+                task_output.output_format = "Pydantic"
+            except Exception:
+                logger.warning(f"Warning: Could not parse output of task {task_id} as Pydantic Model")
+                logger.debug(f"Output that failed Pydantic parsing: {agent_output}")
+
+        task.result = task_output
+        return TaskResult(task_output=task_output, success=True)
+    else:
+        task.status = "failed"
+        return TaskResult(task_output=None, success=False, error="Agent did not produce any output.")
 
 def process_task_context(context_item, verbose=0, user_id=None):
     """
@@ -431,6 +669,8 @@ class AgentTeam:
             _max_retries = 3
         self.completion_checker = _completion_checker if _completion_checker else self.default_completion_checker
         self.task_id_counter = 0
+        self._task_id_lock = threading.Lock()  # Thread-safe task ID assignment
+        self._state_lock = threading.Lock()  # Thread-safe state mutations
         self.verbose = _verbose
         self.max_retries = _max_retries
         self.process = process
@@ -447,17 +687,18 @@ class AgentTeam:
         
         # Set logger level based on verbose
         if _verbose >= 5:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(10)  # DEBUG
         elif _verbose >= 3:
-            logger.setLevel(logging.DEBUG)
+            logger.setLevel(20)  # INFO
         else:
-            logger.setLevel(logging.WARNING)
-            
+            logger.setLevel(30)  # WARNING
+
         # Also set third-party loggers to WARNING
-        logging.getLogger('chromadb').setLevel(logging.WARNING)
-        logging.getLogger('openai').setLevel(logging.WARNING)
-        logging.getLogger('httpx').setLevel(logging.WARNING)
-        logging.getLogger('httpcore').setLevel(logging.WARNING)
+        import logging as _logging
+        get_logger('chromadb').setLevel(_logging.WARNING)
+        get_logger('openai').setLevel(_logging.WARNING)
+        get_logger('httpx').setLevel(_logging.WARNING)
+        get_logger('httpcore').setLevel(_logging.WARNING)
 
         if self.verbose:
             logger.info(f"Using model {self.manager_llm} for manager")
@@ -559,11 +800,12 @@ class AgentTeam:
             self._telemetry = None
 
     def add_task(self, task):
-        task_id = self.task_id_counter
-        task.id = task_id
-        self.tasks[task_id] = task
-        self.task_id_counter += 1
-        return task_id
+        with self._task_id_lock:
+            task_id = self.task_id_counter
+            task.id = task_id
+            self.tasks[task_id] = task
+            self.task_id_counter += 1
+            return task_id
 
     def clean_json_output(self, output: str) -> str:
         cleaned = output.strip()
@@ -628,7 +870,7 @@ class AgentTeam:
         return len(agent_output.strip()) > 0
 
     async def aexecute_task(self, task_id):
-        """Async version of execute_task method"""
+        """Async version of execute_task method - now using DRY helpers"""
         if task_id not in self.tasks:
             display_error(f"Error: Task with ID {task_id} does not exist")
             return
@@ -649,110 +891,18 @@ class AgentTeam:
         if task.status == "not started":
             task.status = "in progress"
 
-        executor_agent = task.agent
-        
-        # Set current agent for token tracking
-        llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
-        if llm and hasattr(llm, 'set_current_agent'):
-            llm.set_current_agent(executor_agent.display_name)
+        # Build execution context using DRY helper
+        context = _build_execution_context(self, task_id)
 
-        # Ensure tools are available from both task and agent
-        tools = task.tools or []
-        if executor_agent and executor_agent.tools:
-            tools.extend(executor_agent.tools)
+        # Execute with agent using DRY helper
+        agent_output = await _execute_with_agent_async(
+            context.executor_agent, context.task_prompt, context.task, 
+            context.tools, stream=self.stream
+        )
 
-        task_prompt = f"""
-You need to do the following task: {task.description}.
-Expected Output: {task.expected_output}.
-"""
-        if task.context:
-            context_results = []  # Use list to avoid duplicates
-            for context_item in task.context:
-                # Use the centralized helper function
-                context_str = process_task_context(context_item, self.verbose, self.user_id)
-                context_results.append(context_str)
-            
-            # Join unique context results with proper formatting
-            unique_contexts = list(dict.fromkeys(context_results))  # Remove duplicates
-            if self.verbose >= 3:
-                logger.info(f"Task {task_id} context items: {len(unique_contexts)}")
-                for i, ctx in enumerate(unique_contexts):
-                    logger.debug(f"Context {i+1}: {ctx[:100]}...")
-            context_separator = '\n\n'
-            task_prompt += f"""
-Context:
-
-{context_separator.join(unique_contexts)}
-"""
-        task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
-
-        if self.verbose >= 2:
-            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
-        logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
-
-        if task.images:
-            # Use shared multimodal helper (DRY - defined at module level)
-            agent_output = await executor_agent.achat(
-                get_multimodal_message(task_prompt, task.images),
-                tools=tools,
-                output_json=task.output_json,
-                output_pydantic=task.output_pydantic,
-                task_name=task.name,
-                task_description=task.description,
-                task_id=task.id
-            )
-        else:
-            agent_output = await executor_agent.achat(
-                task_prompt,
-                tools=tools,
-                output_json=task.output_json,
-                output_pydantic=task.output_pydantic,
-                task_name=task.name,
-                task_description=task.description,
-                task_id=task.id
-            )
-
-        if agent_output:
-            task_output = TaskOutput(
-                description=task.description,
-                summary=task.description[:10],
-                raw=agent_output,
-                agent=executor_agent.display_name,
-                output_format="RAW"
-            )
-            
-            # Add token metrics if available
-            if llm and hasattr(llm, 'last_token_metrics'):
-                token_metrics = llm.last_token_metrics
-                if token_metrics:
-                    task_output.token_metrics = token_metrics
-
-            if task.output_json:
-                cleaned = self.clean_json_output(agent_output)
-                try:
-                    parsed = json.loads(cleaned)
-                    task_output.json_dict = parsed
-                    task_output.output_format = "JSON"
-                except Exception:
-                    logger.warning(f"Warning: Could not parse output of task {task_id} as JSON")
-                    logger.debug(f"Output that failed JSON parsing: {agent_output}")
-
-            if task.output_pydantic:
-                cleaned = self.clean_json_output(agent_output)
-                try:
-                    parsed = json.loads(cleaned)
-                    pyd_obj = task.output_pydantic(**parsed)
-                    task_output.pydantic = pyd_obj
-                    task_output.output_format = "Pydantic"
-                except Exception:
-                    logger.warning(f"Warning: Could not parse output of task {task_id} as Pydantic Model")
-                    logger.debug(f"Output that failed Pydantic parsing: {agent_output}")
-
-            task.result = task_output
-            return task_output
-        else:
-            task.status = "failed"
-            return None
+        # Process result using DRY helper
+        task_result = _process_task_result(self, context, agent_output)
+        return task_result.task_output
 
     async def arun_task(self, task_id):
         """Async version of run_task method"""
@@ -937,7 +1087,7 @@ Context:
                 display_error(f"Error saving task output to file: {e}")
 
     def execute_task(self, task_id):
-        """Synchronous version of execute_task method"""
+        """Synchronous version of execute_task method - now using DRY helpers"""
         if task_id not in self.tasks:
             display_error(f"Error: Task with ID {task_id} does not exist")
             return
@@ -945,12 +1095,6 @@ Context:
         
         logger.info(f"Starting execution of task {task_id}")
         logger.info(f"Task config: {task.config}")
-        
-        # Initialize memory before task execution
-        if not task.memory:
-            task.memory = task.initialize_memory()
-        
-        logger.info(f"Task memory status: {'Initialized' if task.memory else 'Not initialized'}")
         
         # Only import multimodal dependencies if task has images
         if task.images and task.status == "not started":
@@ -967,141 +1111,18 @@ Context:
         if task.status == "not started":
             task.status = "in progress"
 
-        executor_agent = task.agent
-        
-        # Create agent from agent_config if provided and no agent assigned
-        if executor_agent is None and getattr(task, 'agent_config', None):
-            executor_agent = self._create_agent_from_config(task.agent_config)
-            task.agent = executor_agent
-        
-        # Set current agent for token tracking
-        llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
-        if llm and hasattr(llm, 'set_current_agent'):
-            llm.set_current_agent(executor_agent.display_name)
+        # Build execution context using DRY helper
+        context = _build_execution_context(self, task_id)
 
-        # Substitute variables in task description if provided
-        task_description = task.description
-        if getattr(task, 'variables', None):
-            for key, value in task.variables.items():
-                task_description = task_description.replace(f"{{{{{key}}}}}", str(value))
+        # Execute with agent using DRY helper
+        agent_output = _execute_with_agent_sync(
+            context.executor_agent, context.task_prompt, context.task, 
+            context.tools, stream=self.stream
+        )
 
-        task_prompt = f"""
-You need to do the following task: {task_description}.
-Expected Output: {task.expected_output}.
-"""
-        if task.context:
-            context_results = []  # Use list to avoid duplicates
-            for context_item in task.context:
-                # Use the centralized helper function
-                context_str = process_task_context(context_item, self.verbose, self.user_id)
-                context_results.append(context_str)
-            
-            # Join unique context results with proper formatting
-            unique_contexts = list(dict.fromkeys(context_results))  # Remove duplicates
-            if self.verbose >= 3:
-                logger.info(f"Task {task_id} context items: {len(unique_contexts)}")
-                for i, ctx in enumerate(unique_contexts):
-                    logger.debug(f"Context {i+1}: {ctx[:100]}...")
-            context_separator = '\n\n'
-            task_prompt += f"""
-Context:
-
-{context_separator.join(unique_contexts)}
-"""
-
-        # Add memory context if available
-        if task.memory:
-            try:
-                memory_context = task.memory.build_context_for_task(task.description)
-                if memory_context:
-                    # Log detailed memory context for debugging
-                    logger.debug(f"Memory context for task '{task.description}': {memory_context}")
-                    # Include actual memory content without verbose headers (essential for AI agent functionality)
-                    task_prompt += f"\n\n{memory_context}"
-            except Exception as e:
-                logger.error(f"Error getting memory context: {e}")
-
-        task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
-
-        if self.verbose >= 2:
-            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
-        logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
-
-        if task.images:
-            # Use shared multimodal helper (DRY - defined at module level)
-            agent_output = executor_agent.chat(
-                get_multimodal_message(task_prompt, task.images),
-                tools=task.tools,
-                output_json=task.output_json,
-                output_pydantic=task.output_pydantic,
-                task_name=task.name,
-                task_description=task.description,
-                task_id=task_id
-            )
-        else:
-            agent_output = executor_agent.chat(
-                task_prompt,
-                tools=task.tools,
-                output_json=task.output_json,
-                output_pydantic=task.output_pydantic,
-                stream=self.stream,
-                task_name=task.name,
-                task_description=task.description,
-                task_id=task_id
-            )
-
-        if agent_output:
-            # Store the response in memory
-            if task.memory:
-                try:
-                    task.store_in_memory(
-                        content=agent_output,
-                        agent_name=executor_agent.display_name,
-                        task_id=task_id
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to store agent output in memory: {e}")
-
-            task_output = TaskOutput(
-                description=task.description,
-                summary=task.description[:10],
-                raw=agent_output,
-                agent=executor_agent.display_name,
-                output_format="RAW"
-            )
-            
-            # Add token metrics if available
-            if llm and hasattr(llm, 'last_token_metrics'):
-                token_metrics = llm.last_token_metrics
-                if token_metrics:
-                    task_output.token_metrics = token_metrics
-
-            if task.output_json:
-                cleaned = self.clean_json_output(agent_output)
-                try:
-                    parsed = json.loads(cleaned)
-                    task_output.json_dict = parsed
-                    task_output.output_format = "JSON"
-                except Exception:
-                    logger.warning(f"Warning: Could not parse output of task {task_id} as JSON")
-                    logger.debug(f"Output that failed JSON parsing: {agent_output}")
-
-            if task.output_pydantic:
-                cleaned = self.clean_json_output(agent_output)
-                try:
-                    parsed = json.loads(cleaned)
-                    pyd_obj = task.output_pydantic(**parsed)
-                    task_output.pydantic = pyd_obj
-                    task_output.output_format = "Pydantic"
-                except Exception:
-                    logger.warning(f"Warning: Could not parse output of task {task_id} as Pydantic Model")
-                    logger.debug(f"Output that failed Pydantic parsing: {agent_output}")
-
-            task.result = task_output
-            return task_output
-        else:
-            task.status = "failed"
-            return None
+        # Process result using DRY helper
+        task_result = _process_task_result(self, context, agent_output)
+        return task_result.task_output
 
     def run_task(self, task_id):
         """Synchronous version of run_task method"""
@@ -1287,6 +1308,7 @@ Context:
         # ─────────────────────────────────────────────────────────────
         if show_verbose and is_tty:
             from rich.panel import Panel
+            from rich.console import Console
             console = Console()
             import time as time_module
             
@@ -1413,7 +1435,8 @@ Context:
 
     def set_state(self, key: str, value: Any) -> None:
         """Set a state value"""
-        self._state[key] = value
+        with self._state_lock:
+            self._state[key] = value
 
     def get_state(self, key: str, default: Any = None) -> Any:
         """Get a state value"""
@@ -1421,11 +1444,13 @@ Context:
 
     def update_state(self, updates: Dict) -> None:
         """Update multiple state values"""
-        self._state.update(updates)
+        with self._state_lock:
+            self._state.update(updates)
 
     def clear_state(self) -> None:
         """Clear all state values"""
-        self._state.clear()
+        with self._state_lock:
+            self._state.clear()
     
     # Convenience methods for enhanced state management
     def has_state(self, key: str) -> bool:
@@ -1438,19 +1463,21 @@ Context:
     
     def delete_state(self, key: str) -> bool:
         """Delete a state key if it exists. Returns True if deleted, False if key didn't exist."""
-        if key in self._state:
-            del self._state[key]
-            return True
-        return False
+        with self._state_lock:
+            if key in self._state:
+                del self._state[key]
+                return True
+            return False
     
     def increment_state(self, key: str, amount: float = 1, default: float = 0) -> float:
         """Increment a numeric state value. Creates the key with default if it doesn't exist."""
-        current = self._state.get(key, default)
-        if not isinstance(current, (int, float)):
-            raise TypeError(f"Cannot increment non-numeric value at key '{key}': {type(current).__name__}")
-        new_value = current + amount
-        self._state[key] = new_value
-        return new_value
+        with self._state_lock:
+            current = self._state.get(key, default)
+            if not isinstance(current, (int, float)):
+                raise TypeError(f"Cannot increment non-numeric value at key '{key}': {type(current).__name__}")
+            new_value = current + amount
+            self._state[key] = new_value
+            return new_value
     
     def append_to_state(self, key: str, value: Any, max_length: Optional[int] = None) -> List[Any]:
         """Append a value to a list state. Creates the list if it doesn't exist.
@@ -1466,20 +1493,21 @@ Context:
         Raises:
             TypeError: If the existing value is not a list and convert_to_list=False
         """
-        if key not in self._state:
-            self._state[key] = []
-        elif not isinstance(self._state[key], list):
-            # Be explicit about type conversion for better user experience
-            current_value = self._state[key]
-            self._state[key] = [current_value]
-        
-        self._state[key].append(value)
-        
-        # Trim list if max_length is specified
-        if max_length and len(self._state[key]) > max_length:
-            self._state[key] = self._state[key][-max_length:]
-        
-        return self._state[key]
+        with self._state_lock:
+            if key not in self._state:
+                self._state[key] = []
+            elif not isinstance(self._state[key], list):
+                # Be explicit about type conversion for better user experience
+                current_value = self._state[key]
+                self._state[key] = [current_value]
+            
+            self._state[key].append(value)
+            
+            # Trim list if max_length is specified
+            if max_length and len(self._state[key]) > max_length:
+                self._state[key] = self._state[key][-max_length:]
+            
+            return self._state[key]
     
     def save_session_state(self, session_id: str, include_memory: bool = True) -> None:
         """Save current state to memory for session persistence"""
@@ -1521,7 +1549,8 @@ Context:
                 state_data = metadata.get("state_data", {})
                 if "state" in state_data:
                     # Merge with existing state instead of replacing
-                    self._state.update(state_data["state"])
+                    with self._state_lock:
+                        self._state.update(state_data["state"])
                     return True
         
         return False
@@ -1645,16 +1674,18 @@ Context:
                 print("pip install 'praisonaiagents[api]'")
                 return None
             
-            # Initialize port-specific collections if needed
-            if port not in _agents_registered_endpoints:
-                _agents_registered_endpoints[port] = {}
-                
-            # Initialize shared FastAPI app if not already created for this port
-            if _agents_shared_apps.get(port) is None:
-                _agents_shared_apps[port] = FastAPI(
-                    title=f"PraisonAI Agents API (Port {port})",
-                    description="API for interacting with multiple PraisonAI Agents"
-                )
+            # Thread-safe initialization of port-specific collections
+            with _agents_server_lock:
+                # Initialize port-specific collections if needed
+                if port not in _agents_registered_endpoints:
+                    _agents_registered_endpoints[port] = {}
+                    
+                # Initialize shared FastAPI app if not already created for this port
+                if _agents_shared_apps.get(port) is None:
+                    _agents_shared_apps[port] = FastAPI(
+                        title=f"PraisonAI Agents API (Port {port})",
+                        description="API for interacting with multiple PraisonAI Agents"
+                    )
                 
                 # Add a root endpoint with a welcome message
                 @_agents_shared_apps[port].get("/")
@@ -1676,20 +1707,22 @@ Context:
             if not path.startswith('/'):
                 path = f'/{path}'
                 
-            # Check if path is already registered for this port
-            if path in _agents_registered_endpoints[port]:
-                logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
-                print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
-                # Use a modified path to avoid conflicts
-                original_path = path
-                instance_id = str(uuid.uuid4())[:6]
-                path = f"{path}_{instance_id}"
-                logging.warning(f"Using '{path}' instead of '{original_path}'")
-                print(f"🔄 Using '{path}' instead")
-            
-            # Generate a unique ID for this agent group's endpoint
-            endpoint_id = str(uuid.uuid4())
-            _agents_registered_endpoints[port][path] = endpoint_id
+            # Thread-safe path registration 
+            with _agents_server_lock:
+                # Check if path is already registered for this port
+                if path in _agents_registered_endpoints[port]:
+                    logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
+                    print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
+                    # Use a modified path to avoid conflicts
+                    original_path = path
+                    instance_id = str(uuid.uuid4())[:6]
+                    path = f"{path}_{instance_id}"
+                    logging.warning(f"Using '{path}' instead of '{original_path}'")
+                    print(f"🔄 Using '{path}' instead")
+                
+                # Generate a unique ID for this agent group's endpoint
+                endpoint_id = str(uuid.uuid4())
+                _agents_registered_endpoints[port][path] = endpoint_id
             
             # Define the endpoint handler
             @_agents_shared_apps[port].post(path)
@@ -1817,16 +1850,23 @@ Context:
                             )
                     return handle_single_agent
                 
-                # Register the endpoint
+                # Register the endpoint with thread safety
                 _agents_shared_apps[port].post(agent_path)(create_agent_handler(agent_instance))
-                _agents_registered_endpoints[port][agent_path] = f"{endpoint_id}_{agent_id}"
+                with _agents_server_lock:
+                    _agents_registered_endpoints[port][agent_path] = f"{endpoint_id}_{agent_id}"
             
             print(f"🔗 Per-agent endpoints: {', '.join([f'{path}/{aid}' for aid in agents_dict.keys()])}")
             
             # Start the server if it's not already running for this port
-            if not _agents_server_started.get(port, False):
-                # Mark the server as started first to prevent duplicate starts
-                _agents_server_started[port] = True
+            with _agents_server_lock:
+                if not _agents_server_started.get(port, False):
+                    # Mark the server as started first to prevent duplicate starts
+                    _agents_server_started[port] = True
+                    should_start_server = True
+                else:
+                    should_start_server = False
+            
+            if should_start_server:
                 
                 # Start the server in a separate thread
                 def run_server():
@@ -2296,6 +2336,22 @@ Context:
             border_style="cyan"
         ))
         
+        # Emit planning event for trace observers
+        try:
+            from ..trace.protocol import get_default_emitter, ActionEvent
+            import time
+            
+            emitter = get_default_emitter()
+            if emitter and emitter.enabled:
+                emitter.emit(ActionEvent(
+                    event_type="plan_created",
+                    timestamp=time.time(),
+                    agent_name="PlanningAgent",
+                    metadata={"plan": self._todo_list.to_markdown()}
+                ))
+        except Exception:
+            pass
+        
         # Step 4: Create proper Task objects from plan steps
         console.print("\n[bold blue]🚀 EXECUTION PHASE[/bold blue]\n")
         
@@ -2305,7 +2361,8 @@ Context:
         # Store original tasks and create new tasks from plan
         original_tasks = self.tasks.copy()
         self.tasks = {}
-        self.task_id_counter = 0
+        with self._task_id_lock:
+            self.task_id_counter = 0
         
         # Create Task objects from plan steps
         plan_tasks = []
@@ -2410,7 +2467,6 @@ Context:
         # Restore original tasks reference for result retrieval
         self._plan_tasks = self.tasks.copy()
         # Keep plan tasks for results but note original tasks are preserved in _plan_tasks
-
 
 # Backward compatibility aliases (silent - no deprecation warnings)
 # AgentTeam is the primary name (v1.0+)

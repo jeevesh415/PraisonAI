@@ -2,8 +2,8 @@ name: Gemini Issue Review
 
 on:
   workflow_dispatch:
-  issue_comment:
-    types: [created]
+#   issue_comment:
+#     types: [created]
 
 permissions:
   contents: write
@@ -20,7 +20,8 @@ jobs:
        !contains(github.event.comment.body, '@gemini triage') &&
        (github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'COLLABORATOR'))
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'CONTRIBUTOR'))
     runs-on: ubuntu-latest
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -35,12 +36,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+        with:
+          persist-credentials: false
+        with:
           token: ${{ steps.generate_token.outputs.token }}
 
       - name: Set up Git
         run: |
-          git config --local user.email "gemini-bot@github.com"
-          git config --local user.name "Gemini Bot"
+          git config --local user.email "454862+MervinPraison@users.noreply.github.com"
+          git config --local user.name "MervinPraison"
 
       - name: Get issue data
         id: issue_data
@@ -75,16 +80,16 @@ jobs:
           echo "ADDITIONAL_INSTRUCTIONS=$ADDITIONAL_INSTRUCTIONS" >> $GITHUB_OUTPUT
 
       - name: Run Gemini CLI
-        uses: ./.github/actions/gemini
+        uses: google-github-actions/run-gemini-cli@v0
         env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
           ISSUE_NUMBER: ${{ steps.issue_data.outputs.ISSUE_NUMBER }}
           ADDITIONAL_INSTRUCTIONS: ${{ steps.issue_data.outputs.ADDITIONAL_INSTRUCTIONS }}
           REPOSITORY: ${{ github.repository }}
         with:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OTLP_GCP_WIF_PROVIDER: ${{ secrets.OTLP_GCP_WIF_PROVIDER }}
-          OTLP_GOOGLE_CLOUD_PROJECT: ${{ secrets.OTLP_GOOGLE_CLOUD_PROJECT }}
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: 'gemini-2.5-flash'
           prompt: |
             You are a helpful GitHub issue assistant. Your task is to analyze and help with GitHub issues.
             
@@ -103,6 +108,8 @@ jobs:
             - Search codebase for related files using `glob`, `search_file_content`, `list_directory`
             
             **STEP 2: If Code Changes Are Needed**
+            MANDATORY FIRST STEP: Before writing any code, you MUST use `read_file` to carefully read "src/praisonai-agents/AGENTS.md". You must honor this repository's extremely specific Architecture, Protocol-First design rules, and Agent-Centric Philosophy!
+            
             Create a new branch with 'gemini/' prefix:
             - Use: `git checkout -b gemini/issue-${ISSUE_NUMBER}-description`
             - Example: `git checkout -b gemini/issue-123-fix-sequential-tools`
@@ -161,7 +168,7 @@ jobs:
             
             Please proceed with helping resolve this issue following this exact workflow.
 
-          settings_json: |
+          settings: |
             {
               "coreTools": [
                 "run_shell_command(echo)",
@@ -193,10 +200,5 @@ jobs:
                 "web_fetch",
                 "google_web_search",
                 "save_memory"
-              ],
-              "telemetry": {
-                "enabled": false,
-                "otlpGcpWifProvider": "${{ secrets.OTLP_GCP_WIF_PROVIDER }}",
-                "googleCloudProject": "${{ secrets.OTLP_GOOGLE_CLOUD_PROJECT }}"
-              }
+              ]
             }

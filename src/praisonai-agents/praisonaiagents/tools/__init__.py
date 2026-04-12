@@ -1,8 +1,10 @@
 """Tools package for PraisonAI Agents - uses lazy loading for performance"""
 from importlib import import_module
 from typing import Any
+import threading
 
-# Lazy loading cache
+# Thread-safe lazy loading cache
+_tools_lock = threading.Lock()
 _tools_lazy_cache = {}
 
 # Export core tool items for organized imports (lightweight)
@@ -22,6 +24,19 @@ from .validators import (
     PassthroughValidator,
 )
 from .retry import RetryPolicy, FallbackChain, ToolExecutionConfig
+
+# Circuit breaker functionality (lazy loaded)
+_CIRCUIT_BREAKER_EXPORTS = frozenset({
+    'CircuitBreaker', 'CircuitBreakerProtocol', 'CircuitBreakerConfig', 'CircuitBreakerException',
+    'CircuitBreakerStats', 'CircuitState', 'HealthCheckProtocol', 'CircuitBreakerRegistry',
+    'get_circuit_breaker', 'get_all_circuit_breaker_stats', 'reset_all_circuit_breakers',
+    # Integration utilities
+    'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy',
+    # Health monitoring
+    'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+    'get_health_monitor', 'get_circuit_breaker_dashboard_data'
+})
 
 # Map of function names to their module and class (if any)
 TOOL_MAPPINGS = {
@@ -150,6 +165,12 @@ TOOL_MAPPINGS = {
     'SkillTools': ('.skill_tools', 'SkillTools'),
     'skill_tools': ('.skill_tools', None),
     
+    # Github Tools
+    'github_create_branch': ('.github_tools', None),
+    'github_commit_and_push': ('.github_tools', None),
+    'github_create_pull_request': ('.github_tools', None),
+    'github_tools': ('.github_tools', None),
+    
     # Schedule Tools (agent-centric scheduling)
     'schedule_add': ('.schedule_tools', None),
     'schedule_list': ('.schedule_tools', None),
@@ -185,7 +206,16 @@ TOOL_MAPPINGS = {
     'email_tools': ('.email_tools', None),
 }
 
-_instances = {}  # Cache for class instances
+# Tool factory functions - caches classes but creates fresh instances
+# This prevents state leakage between concurrent agents while optimizing import performance
+_loaded_classes = {}  # Cache the Class, NOT the instance
+
+def _create_tool_instance(class_name: str, module_path: str):
+    """Create a new tool instance. Caches the class but returns fresh instances to prevent state sharing."""
+    if class_name not in _loaded_classes:
+        module = import_module(module_path, __package__)
+        _loaded_classes[class_name] = getattr(module, class_name)
+    return _loaded_classes[class_name]()  # Fresh instance safe for multi-agent
 
 # Profile exports (lazy loaded)
 _PROFILE_EXPORTS = frozenset({
@@ -195,7 +225,65 @@ _PROFILE_EXPORTS = frozenset({
 
 def __getattr__(name: str) -> Any:
     """Smart lazy loading of tools and profiles."""
-    # Handle profile imports first
+    # Handle circuit breaker imports first
+    if name in _CIRCUIT_BREAKER_EXPORTS:
+        from .circuit_breaker import (
+            CircuitBreaker, CircuitBreakerProtocol, CircuitBreakerConfig, CircuitBreakerException,
+            CircuitBreakerStats, CircuitState, HealthCheckProtocol, CircuitBreakerRegistry,
+            get_circuit_breaker, get_all_circuit_breaker_stats, reset_all_circuit_breakers
+        )
+        # Lazy import integration utilities
+        integration_imports = {}
+        if name in {'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+                    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy'}:
+            from .circuit_breaker_integrations import (
+                with_circuit_breaker, LLMCircuitBreakerIntegration, MemoryCircuitBreakerIntegration,
+                MCPCircuitBreakerIntegration, create_resilient_external_call, integrate_with_retry_policy
+            )
+            integration_imports.update({
+                'with_circuit_breaker': with_circuit_breaker,
+                'LLMCircuitBreakerIntegration': LLMCircuitBreakerIntegration,
+                'MemoryCircuitBreakerIntegration': MemoryCircuitBreakerIntegration,
+                'MCPCircuitBreakerIntegration': MCPCircuitBreakerIntegration,
+                'create_resilient_external_call': create_resilient_external_call,
+                'integrate_with_retry_policy': integrate_with_retry_policy,
+            })
+        
+        # Lazy import health monitoring
+        health_imports = {}
+        if name in {'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+                    'get_health_monitor', 'get_circuit_breaker_dashboard_data'}:
+            from .health_monitor import (
+                HealthMonitor, HealthMetrics, ServiceHealthConfig, TelemetryProtocol,
+                get_health_monitor, get_circuit_breaker_dashboard_data
+            )
+            health_imports.update({
+                'HealthMonitor': HealthMonitor,
+                'HealthMetrics': HealthMetrics,
+                'ServiceHealthConfig': ServiceHealthConfig,
+                'TelemetryProtocol': TelemetryProtocol,
+                'get_health_monitor': get_health_monitor,
+                'get_circuit_breaker_dashboard_data': get_circuit_breaker_dashboard_data,
+            })
+        
+        _circuit_breaker_map = {
+            'CircuitBreaker': CircuitBreaker,
+            'CircuitBreakerProtocol': CircuitBreakerProtocol,
+            'CircuitBreakerConfig': CircuitBreakerConfig,
+            'CircuitBreakerException': CircuitBreakerException,
+            'CircuitBreakerStats': CircuitBreakerStats,
+            'CircuitState': CircuitState,
+            'HealthCheckProtocol': HealthCheckProtocol,
+            'CircuitBreakerRegistry': CircuitBreakerRegistry,
+            'get_circuit_breaker': get_circuit_breaker,
+            'get_all_circuit_breaker_stats': get_all_circuit_breaker_stats,
+            'reset_all_circuit_breakers': reset_all_circuit_breakers,
+            **integration_imports,
+            **health_imports,
+        }
+        return _circuit_breaker_map[name]
+    
+    # Handle profile imports
     if name in _PROFILE_EXPORTS:
         from .profiles import (
             ToolProfile, AUTONOMY_PROFILE, BUILTIN_PROFILES,
@@ -240,6 +328,7 @@ def __getattr__(name: str) -> Any:
             'search_web', 'web_search', 'get_available_providers',
             'web_crawl', 'crawl_web', 'get_available_crawl_providers',
             'run_skill_script', 'read_skill_file', 'list_skill_scripts', 'create_skill_tools',
+            'github_create_branch', 'github_commit_and_push', 'github_create_pull_request',
             'schedule_add', 'schedule_list', 'schedule_remove',
             'ast_grep_search', 'ast_grep_rewrite', 'ast_grep_scan', 'is_ast_grep_available', 'get_ast_grep_tools',
             'store_memory', 'search_memory',
@@ -248,18 +337,14 @@ def __getattr__(name: str) -> Any:
             'smtp_send_email', 'smtp_read_inbox'
         ]:
             return getattr(module, name)
-        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'schedule_tools', 'ast_grep_tools', 'email_tools']:
+        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'schedule_tools', 'ast_grep_tools', 'email_tools']:
             return module  # Returns the callable module
         return getattr(module, name)
     else:
-        # Class method import
-        if class_name not in _instances:
-            module = import_module(module_path, __package__)
-            class_ = getattr(module, class_name)
-            _instances[class_name] = class_()
-        
-        # Get the method and bind it to the instance
-        method = getattr(_instances[class_name], name)
+        # Create a fresh tool instance for each agent/session to prevent state leakage
+        # This factory pattern ensures multi-agent safety by avoiding shared mutable state
+        instance = _create_tool_instance(class_name, module_path)
+        method = getattr(instance, name)
         return method
 
 __all__ = list(TOOL_MAPPINGS.keys()) + [
@@ -271,6 +356,16 @@ __all__ = list(TOOL_MAPPINGS.keys()) + [
     # Validation and retry protocols
     'ValidationResult', 'ToolValidatorProtocol', 'AsyncToolValidatorProtocol', 'PassthroughValidator',
     'RetryPolicy', 'FallbackChain', 'ToolExecutionConfig',
+    # Circuit breaker functionality
+    'CircuitBreaker', 'CircuitBreakerProtocol', 'CircuitBreakerConfig', 'CircuitBreakerException',
+    'CircuitBreakerStats', 'CircuitState', 'HealthCheckProtocol', 'CircuitBreakerRegistry',
+    'get_circuit_breaker', 'get_all_circuit_breaker_stats', 'reset_all_circuit_breakers',
+    # Integration utilities
+    'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy',
+    # Health monitoring
+    'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+    'get_health_monitor', 'get_circuit_breaker_dashboard_data',
     # Tool profiles (DRY tool sets for autonomy/interactive modes)
     'ToolProfile', 'AUTONOMY_PROFILE', 'BUILTIN_PROFILES',
     'register_profile', 'get_profile', 'resolve_profiles', 'list_profiles',

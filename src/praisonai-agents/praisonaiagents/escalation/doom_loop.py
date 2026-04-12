@@ -11,9 +11,9 @@ from enum import Enum
 import time
 import hashlib
 import logging
+from praisonaiagents._logging import get_logger
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class DoomLoopType(Enum):
     """Types of doom loops that can be detected."""
@@ -24,7 +24,6 @@ class DoomLoopType(Enum):
     RESOURCE_EXHAUSTION = "resource_exhaustion"  # Budget exceeded
     REPEATED_OUTPUT = "repeated_output"      # Same output text repeated (content chanting)
 
-
 class RecoveryAction(Enum):
     """Actions to take when doom loop is detected."""
     CONTINUE = "continue"           # Continue execution
@@ -32,7 +31,6 @@ class RecoveryAction(Enum):
     ESCALATE_MODEL = "escalate_model"    # Try stronger model
     REQUEST_HELP = "request_help"        # Ask user for clarification
     ABORT = "abort"                      # Stop execution safely
-
 
 @dataclass
 class DoomLoopConfig:
@@ -64,7 +62,6 @@ class DoomLoopConfig:
     max_repeated_chunks: int = 8         # Max identical output chunks before flagging
     content_chunk_size: int = 50         # Sliding window chunk size (chars)
 
-
 @dataclass
 class DoomLoopEvent:
     """Event representing a doom loop detection."""
@@ -74,7 +71,6 @@ class DoomLoopEvent:
     recovery_action: RecoveryAction
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
-
 
 @dataclass
 class ActionRecord:
@@ -87,7 +83,6 @@ class ActionRecord:
     timestamp: float
     duration: float
     metadata: Dict[str, Any] = field(default_factory=dict)
-
 
 class DoomLoopDetector:
     """
@@ -185,7 +180,7 @@ class DoomLoopDetector:
         chunk_size = self.config.content_chunk_size
         for i in range(0, len(text) - chunk_size + 1, chunk_size):
             chunk = text[i:i + chunk_size]
-            chunk_hash = hashlib.md5(chunk.encode()).hexdigest()[:16]
+            chunk_hash = hashlib.sha256(chunk.encode()).hexdigest()[:16]
             self._content_chunk_counts[chunk_hash] = self._content_chunk_counts.get(chunk_hash, 0) + 1
     
     def mark_progress(self, marker: str):
@@ -331,18 +326,18 @@ class DoomLoopDetector:
     def _hash_action(self, action_type: str, args: Dict[str, Any]) -> str:
         """Create hash for action + args."""
         content = f"{action_type}:{self._hash_dict(args)}"
-        return hashlib.md5(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
     
     def _hash_dict(self, d: Dict[str, Any]) -> str:
         """Create hash for dictionary."""
         # Sort keys for consistent hashing
         content = str(sorted(d.items()))
-        return hashlib.md5(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
     
     def _hash_result(self, result: Any) -> str:
         """Create hash for result."""
         content = str(result)[:1000]  # Limit size
-        return hashlib.md5(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
     
     def _check_repeated_identical(self) -> bool:
         """Check for repeated identical actions."""

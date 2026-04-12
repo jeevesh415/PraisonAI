@@ -1,16 +1,16 @@
 # Rust Feature Parity Tracker
 
-> **Python Features:** 282 | **Rust Features:** 666 | **Parity:** 100.0%
+> **Python Features:** 321 | **Rust Features:** 667 | **Parity:** 88.8%
 
 ## Summary
 
 | Metric | Count |
 |--------|-------|
-| Python Core Features | 282 |
-| Rust Features | 666 |
-| **Actual Gap Count** | **0** |
-| Language Limitations (N/A) | 6 |
-| **Parity** | **100.0%** |
+| Python Core Features | 321 |
+| Rust Features | 667 |
+| **Actual Gap Count** | **36** |
+| Language Limitations (N/A) | 5 |
+| **Parity** | **88.8%** |
 
 ## Implemented Features
 
@@ -471,6 +471,7 @@
 - ✅ `Tool`
 - ✅ `ToolCall`
 - ✅ `ToolCallData`
+- ✅ `ToolCallFunction`
 - ✅ `ToolCallResult`
 - ✅ `ToolDefinition`
 - ✅ `ToolPluginProtocol`
@@ -688,9 +689,47 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ⚠️ `config` → Use `parity_config` instead
 - ⚠️ `db` → Use `parity_db` instead
 - ⚠️ `memory` (Rust reserved/module conflict)
-- ⚠️ `obs` → Use `parity_obs` instead
 - ⚠️ `tools` (Rust reserved/module conflict)
 - ⚠️ `workflows` (Rust reserved/module conflict)
+
+## Missing Features
+
+- ❌ `AsyncLearnProtocol`
+- ❌ `AutoApproveBackend`
+- ❌ `BaseTool`
+- ❌ `BotOSConfig`
+- ❌ `BotOSProtocol`
+- ❌ `BudgetExceededError`
+- ❌ `ConsoleBackend`
+- ❌ `DoomLoopDetector`
+- ❌ `ErrorContextProtocol`
+- ❌ `EscalationPipeline`
+- ❌ `EscalationStage`
+- ❌ `Heartbeat`
+- ❌ `HeartbeatConfig`
+- ❌ `LLMError`
+- ❌ `LearnBackend`
+- ❌ `LearnConfig`
+- ❌ `LearnManager`
+- ❌ `LearnManagerProtocol`
+- ❌ `LearnMode`
+- ❌ `LearnProtocol`
+- ❌ `LearnScope`
+- ❌ `ManagedBackendProtocol`
+- ❌ `NetworkError`
+- ❌ `ObservabilityEventType`
+- ❌ `ObservabilityHooks`
+- ❌ `PraisonAIError`
+- ❌ `StructuredFormatter`
+- ❌ `ToolExecutionError`
+- ❌ `ToolValidationError`
+- ❌ `configure_structured_logging`
+- ❌ `get_logger`
+- ❌ `get_registry`
+- ❌ `get_tool`
+- ❌ `parallel_handoffs`
+- ❌ `register_tool`
+- ❌ `validate_tool`
 
 ---
 

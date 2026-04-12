@@ -2,15 +2,19 @@ import os
 import time
 import json
 import logging
+import threading
+from praisonaiagents._logging import get_logger
 from typing import List, Optional, Dict, Any, Union, Literal, Type
 from pydantic import BaseModel, ConfigDict
-from rich import print
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from rich.markdown import Markdown
-from rich.live import Live
 import asyncio
+
+def _rich():
+    """Lazy-load Rich display classes (cached by sys.modules after first call)."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.markdown import Markdown
+    return Console, Panel, Text, Markdown
 
 # Import token metrics if available
 try:
@@ -20,15 +24,20 @@ except ImportError:
 
 # Logging is already configured in _logging.py via __init__.py
 
-# Global list to store error logs
-error_logs = []
+# Global list to store error logs - with bounded size to prevent memory leaks
+from collections import deque
+MAX_ERROR_LOGS = 1000  # Maximum number of error logs to keep in memory
+error_logs = deque(maxlen=MAX_ERROR_LOGS)  # Ring buffer that auto-evicts old errors
+_error_logs_lock = threading.Lock()
 
 # Separate registries for sync and async callbacks
 sync_display_callbacks = {}
 async_display_callbacks = {}
+_callbacks_lock = threading.Lock()
 
 # Global approval callback registry
 approval_callback = None
+_approval_callback_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PraisonAI Unique Color Palette: "Elegant Intelligence"
@@ -125,10 +134,11 @@ def register_display_callback(display_type: str, callback_fn, is_async: bool = F
         callback_fn: The callback function to register
         is_async (bool): Whether the callback is asynchronous
     """
-    if is_async:
-        async_display_callbacks[display_type] = callback_fn
-    else:
-        sync_display_callbacks[display_type] = callback_fn
+    with _callbacks_lock:
+        if is_async:
+            async_display_callbacks[display_type] = callback_fn
+        else:
+            sync_display_callbacks[display_type] = callback_fn
 
 def register_approval_callback(callback_fn):
     """Register a global approval callback function for dangerous tool operations.
@@ -137,13 +147,12 @@ def register_approval_callback(callback_fn):
         callback_fn: Function that takes (function_name, arguments, risk_level) and returns ApprovalDecision
     """
     global approval_callback
-    approval_callback = callback_fn
-
+    with _approval_callback_lock:
+        approval_callback = callback_fn
 
 # Simplified aliases (consistent naming convention)
 add_display_callback = register_display_callback
 add_approval_callback = register_approval_callback
-
 
 def execute_sync_callback(display_type: str, **kwargs):
     """Execute synchronous callback for a given display type without displaying anything.
@@ -154,8 +163,10 @@ def execute_sync_callback(display_type: str, **kwargs):
         display_type (str): Type of display event
         **kwargs: Arguments to pass to the callback function
     """
-    if display_type in sync_display_callbacks:
-        callback = sync_display_callbacks[display_type]
+    with _callbacks_lock:
+        callback = sync_display_callbacks.get(display_type)
+    
+    if callback:
         import inspect
         sig = inspect.signature(callback)
         
@@ -179,9 +190,12 @@ async def execute_callback(display_type: str, **kwargs):
     import inspect
     
     # Execute synchronous callback if registered
-    if display_type in sync_display_callbacks:
-        callback = sync_display_callbacks[display_type]
-        sig = inspect.signature(callback)
+    with _callbacks_lock:
+        sync_callback = sync_display_callbacks.get(display_type)
+        async_callback = async_display_callbacks.get(display_type)
+    
+    if sync_callback:
+        sig = inspect.signature(sync_callback)
         
         # Filter kwargs to what the callback accepts to maintain backward compatibility
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
@@ -192,11 +206,11 @@ async def execute_callback(display_type: str, **kwargs):
             supported_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
         
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: callback(**supported_kwargs))
+        await loop.run_in_executor(None, lambda: sync_callback(**supported_kwargs))
     
     # Execute asynchronous callback if registered
-    if display_type in async_display_callbacks:
-        callback = async_display_callbacks[display_type]
+    if async_callback:
+        callback = async_callback
         sig = inspect.signature(callback)
         
         # Filter kwargs to what the callback accepts to maintain backward compatibility
@@ -239,16 +253,17 @@ def display_interaction(message, response, markdown=True, generation_time=None, 
     Args:
         metrics: Optional dict with token_in, token_out, cost, model for footer display
     """
+    Console, Panel, Text, Markdown = _rich()
     if console is None:
         console = Console()
-    
+
     if isinstance(message, list):
         text_content = next((item["text"] for item in message if item["type"] == "text"), "")
         message = text_content
 
     message = _clean_display_content(str(message))
     response = _clean_display_content(str(response))
-    
+
     # Skip display if response is empty (common with Gemini tool calls)
     if not response or not response.strip():
         return
@@ -268,12 +283,12 @@ def display_interaction(message, response, markdown=True, generation_time=None, 
         task_id=task_id,
         metrics=metrics
     )
-    
+
     # Build response title with time
     response_title = "Response"
     if generation_time:
         response_title = f"Response ({generation_time:.1f}s)"
-    
+
     # Build response content with optional metrics footer
     response_content = response
     if metrics and isinstance(metrics, dict):
@@ -282,7 +297,7 @@ def display_interaction(message, response, markdown=True, generation_time=None, 
         tokens_out = metrics.get('tokens_out', 0)
         cost = metrics.get('cost', 0)
         model = metrics.get('model', '')
-        
+
         metrics_line = f"\n\n─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n📊 {tokens_in} tokens in · {tokens_out} out"
         if cost > 0:
             metrics_line += f" · ${cost:.4f}"
@@ -303,25 +318,27 @@ def display_interaction(message, response, markdown=True, generation_time=None, 
 def display_self_reflection(message: str, console=None):
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
-    
+
     # Execute synchronous callbacks
     execute_sync_callback('self_reflection', message=message)
-    
+
     console.print(Panel.fit(Text(message, style="bold yellow"), title="Self Reflection", border_style="magenta"))
 
 def display_instruction(message: str, console=None, agent_name: str = None, agent_role: str = None, agent_tools: List[str] = None):
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
-    
+
     # Execute synchronous callbacks
     execute_sync_callback('instruction', message=message, agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools)
-    
+
     # Display agent info if available
     if agent_name:
         agent_info = f"[bold #FF9B9B]👤 Agent:[/] [#FFE5E5]{agent_name}[/]"
@@ -331,9 +348,9 @@ def display_instruction(message: str, console=None, agent_name: str = None, agen
             tools_str = ", ".join(f"[italic #B4D4FF]{tool}[/]" for tool in agent_tools)
             agent_info += f"\n[bold #86A789]Tools:[/] {tools_str}"
         console.print(Panel(agent_info, border_style="#D2E3C8", title="[bold]Agent Info[/]", title_align="left", padding=(1, 2)))
-    
+
     # Only print if log level is DEBUG
-    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+    if get_logger().getEffectiveLevel() == logging.DEBUG:
         console.print(Panel.fit(Text(message, style="bold blue"), title="Instruction", border_style="cyan"))
 
 def display_tool_call(message: str, console=None, tool_name: str = None, tool_input: dict = None, tool_output: str = None, elapsed_time: float = None, success: bool = True):
@@ -400,51 +417,54 @@ def display_tool_call(message: str, console=None, tool_name: str = None, tool_in
 def display_error(message: str, console=None):
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
-    
+
     # Execute synchronous callbacks
     execute_sync_callback('error', message=message)
-    
+
     # Use semantic error color
     console.print(Panel.fit(
-        Text(message, style=f"bold {PRAISON_COLORS['error_text']}"), 
-        title="⚠ Error", 
+        Text(message, style=f"bold {PRAISON_COLORS['error_text']}"),
+        title="⚠ Error",
         border_style=PRAISON_COLORS["error"]
     ))
-    error_logs.append(message)
+    with _error_logs_lock:
+        error_logs.append(message)
 
 def display_generating(content: str = "", start_time: Optional[float] = None):
     if not content or not str(content).strip():
         logging.debug("Empty content in display_generating, returning early")
         return None
-    
+
     elapsed_str = ""
     if start_time is not None:
         elapsed = time.time() - start_time
         elapsed_str = f" {elapsed:.1f}s"
-    
+
     content = _clean_display_content(str(content))
-    
+
     # Execute synchronous callbacks
     execute_sync_callback('generating', content=content, elapsed_time=elapsed_str.strip() if elapsed_str else None)
-    
-    # Use semantic response color
+
+    _Console, Panel, _Text, Markdown = _rich()
     return Panel(Markdown(content), title=f"Generating...{elapsed_str}", border_style=PRAISON_COLORS["response"])
 
 def display_reasoning_steps(steps: List[str], console=None):
     """Display reasoning steps with unique numbered circles.
-    
+
     Uses ①②③ numbered circles for a distinctive, scannable format
     that shows the agent's thought process.
-    
+
     Args:
         steps: List of reasoning step descriptions
         console: Rich console for output
     """
     if not steps:
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     
@@ -470,18 +490,19 @@ def display_reasoning_steps(steps: List[str], console=None):
 
 def display_working_status(phase: int = 0, status_text: str = None, console=None):
     """Display animated working status with pulsing dots.
-    
+
     Shows a unique "Working ●○○" indicator with phase-specific status.
     This is PraisonAI's distinctive approach to showing processing status.
-    
+
     Args:
         phase: Current animation phase (0-3)
         status_text: Optional status description
         console: Rich console for output
-    
+
     Returns:
         Panel object for use with Rich.Live
     """
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     
@@ -501,6 +522,7 @@ def display_working_status(phase: int = 0, status_text: str = None, console=None
 # Async versions with 'a' prefix
 async def adisplay_interaction(message, response, markdown=True, generation_time=None, console=None, agent_name=None, agent_role=None, agent_tools=None, task_name=None, task_description=None, task_id=None):
     """Async version of display_interaction."""
+    Console, Panel, Text, Markdown = _rich()
     if console is None:
         console = Console()
     
@@ -541,6 +563,7 @@ async def adisplay_self_reflection(message: str, console=None):
     """Async version of display_self_reflection."""
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
@@ -554,6 +577,7 @@ async def adisplay_instruction(message: str, console=None, agent_name: str = Non
     """Async version of display_instruction."""
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
@@ -572,7 +596,7 @@ async def adisplay_instruction(message: str, console=None, agent_name: str = Non
         console.print(Panel(agent_info, border_style="#D2E3C8", title="[bold]Agent Info[/]", title_align="left", padding=(1, 2)))
     
     # Only print if log level is DEBUG
-    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+    if get_logger().getEffectiveLevel() == logging.DEBUG:
         console.print(Panel.fit(Text(message, style="bold blue"), title="Instruction", border_style="cyan"))
 
 async def adisplay_tool_call(message: str, console=None):
@@ -581,6 +605,7 @@ async def adisplay_tool_call(message: str, console=None):
     if not message or not message.strip():
         logging.debug("Empty message in adisplay_tool_call, returning early")
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
@@ -595,6 +620,7 @@ async def adisplay_error(message: str, console=None):
     """Async version of display_error."""
     if not message or not message.strip():
         return
+    Console, Panel, Text, _Md = _rich()
     if console is None:
         console = Console()
     message = _clean_display_content(str(message))
@@ -603,24 +629,26 @@ async def adisplay_error(message: str, console=None):
     await execute_callback('error', message=message)
     
     console.print(Panel.fit(Text(message, style="bold red"), title="Error", border_style="red"))
-    error_logs.append(message)
+    with _error_logs_lock:
+        error_logs.append(message)
 
 async def adisplay_generating(content: str = "", start_time: Optional[float] = None):
     """Async version of display_generating."""
     if not content or not str(content).strip():
         logging.debug("Empty content in adisplay_generating, returning early")
         return None
-    
+
     elapsed_str = ""
     if start_time is not None:
         elapsed = time.time() - start_time
         elapsed_str = f" {elapsed:.1f}s"
-    
+
     content = _clean_display_content(str(content))
-    
+
     # Execute callbacks
     await execute_callback('generating', content=content, elapsed_time=elapsed_str.strip() if elapsed_str else None)
-    
+
+    _Console, Panel, _Text, Markdown = _rich()
     return Panel(Markdown(content), title=f"Generating...{elapsed_str}", border_style="green")
 
 def clean_triple_backticks(text: str) -> str:
@@ -637,7 +665,6 @@ def clean_triple_backticks(text: str) -> str:
 class ReflectionOutput(BaseModel):
     reflection: str
     satisfactory: Literal["yes", "no"]
-
 
 class TaskOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)

@@ -163,8 +163,14 @@ def get_output_controller() -> OutputController:
 
 
 # Import and register command groups
+_commands_registered = False
+
 def register_commands():
-    """Register all command groups."""
+    """Register all command groups (idempotent)."""
+    global _commands_registered
+    if _commands_registered:
+        return
+    _commands_registered = True
     # Import command modules - Core commands
     from .commands.config import app as config_app
     from .commands.traces import app as traces_app
@@ -222,6 +228,7 @@ def register_commands():
     from .commands.replay import app as replay_app
     from .commands.loop import app as loop_app
     from .commands.tracker import app as tracker_app
+    from .commands.github import app as github_app
     
     # Import new moltbot-inspired commands
     from .commands.bot import app as bot_app
@@ -230,6 +237,10 @@ def register_commands():
     from .commands.plugins import app as plugins_app
     from .commands.sandbox import app as sandbox_app
     from .commands.claw import app as claw_app
+    from .commands.flow import app as flow_app
+    from .commands.langfuse import app as langfuse_app
+    from .commands.port import app as port_app
+    from .commands.managed import app as managed_app
     
     # Import TUI and queue commands
     from .features.tui.debug import create_debug_app as create_tui_debug_app
@@ -262,7 +273,7 @@ def register_commands():
     app.add_typer(call_app, name="call", help="Voice/call interaction mode")
     app.add_typer(realtime_app, name="realtime", help="Realtime interaction mode")
     app.add_typer(train_app, name="train", help="Model training and fine-tuning")
-    app.add_typer(ui_app, name="ui", help="Web UI management")
+    app.add_typer(ui_app, name="ui", help="🤖 Clean Chat UI (praisonaiui)")
     app.add_typer(context_app, name="context", help="Context management")
     app.add_typer(research_app, name="research", help="Research and analysis")
     app.add_typer(memory_app, name="memory", help="Memory management")
@@ -294,6 +305,8 @@ def register_commands():
     app.add_typer(replay_app, name="replay", help="Context replay for debugging agent execution")
     app.add_typer(loop_app, name="loop", help="Autonomous agent execution loops")
     app.add_typer(tracker_app, name="tracker", help="Autonomous agent tracking with step-by-step analysis")
+    app.add_typer(github_app, name="github", help="GitHub native context tracking and Issue triage")
+    app.add_typer(managed_app, name="managed", help="Managed Agents (Anthropic cloud-hosted backend)")
     
     # Helper function for loading agents from config
     def _load_agents_from_config_file(config_path: str, console) -> list:
@@ -408,6 +421,9 @@ def register_commands():
     app.add_typer(plugins_app, name="plugins", help="Plugin management and inspection")
     app.add_typer(sandbox_app, name="sandbox", help="Sandbox container management")
     app.add_typer(claw_app, name="claw", help="🦞 PraisonAI Dashboard (full UI)")
+    app.add_typer(flow_app, name="flow", help="Visual workflow builder (Langflow)")
+    app.add_typer(langfuse_app, name="langfuse", help="🔍 Langfuse observability platform")
+    app.add_typer(port_app, name="port", help="🔌 Manage port usage and resolve conflicts")
     
     # Register standardise command
     try:

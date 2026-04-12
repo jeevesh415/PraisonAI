@@ -51,6 +51,12 @@ class ShellTools:
             Dictionary with execution results
         """
         try:
+            # Strip wrapping quotes the LLM sometimes adds around the whole command string
+            if command and len(command) >= 2 and command[0] == command[-1] and command[0] in ("'", '"'):
+                command = command[1:-1]
+            # Treat empty-string cwd same as None to avoid subprocess failure
+            if not cwd:
+                cwd = None
             # Always split command for safety (no shell execution)
             # Use shlex.split with appropriate posix flag
             if platform.system() == 'Windows':
@@ -58,6 +64,9 @@ class ShellTools:
                 command = shlex.split(command, posix=False)
             else:
                 command = shlex.split(command)
+            # Guard against empty command list (e.g. LLM passed empty string)
+            if not command:
+                return {"error": "Empty command", "stdout": "", "stderr": "", "exit_code": 1}
             
             # Expand tilde and environment variables in command arguments
             # (shell=False means the shell won't do this for us)
@@ -271,30 +280,11 @@ class ShellTools:
             logging.error(error_msg)
             return {}
 
-# Lazy instance — deferred so module can be imported without psutil
-_shell_tools = None
-
-def _get_shell_tools():
-    global _shell_tools
-    if _shell_tools is None:
-        _shell_tools = ShellTools()
-    return _shell_tools
-
-def execute_command(*args, **kwargs):
-    """Execute a shell command safely."""
-    return _get_shell_tools().execute_command(*args, **kwargs)
-
-def list_processes(*args, **kwargs):
-    """List running processes with their details."""
-    return _get_shell_tools().list_processes(*args, **kwargs)
-
-def kill_process(*args, **kwargs):
-    """Kill a process by its PID."""
-    return _get_shell_tools().kill_process(*args, **kwargs)
-
-def get_system_info(*args, **kwargs):
-    """Get system information."""
-    return _get_shell_tools().get_system_info(*args, **kwargs)
+_shell_tools = ShellTools()
+execute_command = _shell_tools.execute_command
+list_processes = _shell_tools.list_processes
+kill_process = _shell_tools.kill_process
+get_system_info = _shell_tools.get_system_info
 
 if __name__ == "__main__":
     # Example usage

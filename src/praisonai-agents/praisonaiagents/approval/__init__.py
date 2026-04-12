@@ -33,6 +33,7 @@ import asyncio
 import contextvars
 import json
 import logging
+from praisonaiagents._logging import get_logger
 import os
 from dataclasses import dataclass, field
 from functools import wraps
@@ -45,30 +46,37 @@ from .protocols import ApprovalDecision  # noqa: F401
 from .backends import AutoApproveBackend, ConsoleBackend, CallbackBackend, AgentApproval  # noqa: F401
 from .registry import ApprovalRegistry, DEFAULT_DANGEROUS_TOOLS  # noqa: F401
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Singleton registry ───────────────────────────────────────────────────────
 
-_registry: Optional[ApprovalRegistry] = None
+import threading
 
+_registry: Optional[ApprovalRegistry] = None
+_registry_lock = threading.Lock()
 
 def get_approval_registry() -> ApprovalRegistry:
     """Return the global singleton :class:`ApprovalRegistry`."""
     global _registry
-    if _registry is None:
-        _registry = ApprovalRegistry()
-    return _registry
-
+    with _registry_lock:
+        if _registry is None:
+            _registry = ApprovalRegistry()
+        return _registry
 
 # ── Backward-compatible API (delegates to registry) ─────────────────────────
 
 # These globals are kept for code that imports them directly.
-APPROVAL_REQUIRED_TOOLS: Set[str] = get_approval_registry()._required_tools
-TOOL_RISK_LEVELS: Dict[str, str] = get_approval_registry()._risk_levels
+# NOTE: Accessing these will trigger lazy initialization of the registry
+def __getattr__(name):
+    """Module-level attribute access for lazy initialization."""
+    if name == "APPROVAL_REQUIRED_TOOLS":
+        return get_approval_registry()._required_tools
+    elif name == "TOOL_RISK_LEVELS":
+        return get_approval_registry()._risk_levels
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # Legacy global callback holder — set_approval_callback wraps it into a backend
 approval_callback: Optional[Callable] = None
-
 
 def set_approval_callback(callback_fn: Optional[Callable]) -> None:
     """Set a custom approval callback (legacy API).
@@ -84,39 +92,30 @@ def set_approval_callback(callback_fn: Optional[Callable]) -> None:
     else:
         reg.remove_backend()
 
-
 def get_approval_callback() -> Optional[Callable]:
     """Get the current approval callback function (legacy API)."""
     return approval_callback
 
-
 def mark_approved(tool_name: str) -> None:
     get_approval_registry().mark_approved(tool_name)
-
 
 def is_already_approved(tool_name: str) -> bool:
     return get_approval_registry().is_already_approved(tool_name)
 
-
 def is_yaml_approved(tool_name: str) -> bool:
     return get_approval_registry().is_yaml_approved(tool_name)
-
 
 def is_env_auto_approve() -> bool:
     return ApprovalRegistry.is_env_auto_approve()
 
-
 def set_yaml_approved_tools(tools: List[str]) -> contextvars.Token:
     return get_approval_registry().set_yaml_approved_tools(tools)
-
 
 def reset_yaml_approved_tools(token: contextvars.Token) -> None:
     get_approval_registry().reset_yaml_approved_tools(token)
 
-
 def clear_approval_context() -> None:
     get_approval_registry().clear_approved()
-
 
 def configure_default_approvals() -> None:
     """Re-configure default dangerous tools (idempotent)."""
@@ -124,26 +123,23 @@ def configure_default_approvals() -> None:
     for tool_name, risk_level in DEFAULT_DANGEROUS_TOOLS.items():
         reg.add_requirement(tool_name, risk_level)
 
-
 def add_approval_requirement(tool_name: str, risk_level: str = "high") -> None:
-    get_approval_registry().add_requirement(tool_name, risk_level)
-    APPROVAL_REQUIRED_TOOLS.add(tool_name)
-    TOOL_RISK_LEVELS[tool_name] = risk_level
-
+    reg = get_approval_registry()
+    reg.add_requirement(tool_name, risk_level)
+    reg._required_tools.add(tool_name)
+    reg._risk_levels[tool_name] = risk_level
 
 def remove_approval_requirement(tool_name: str) -> None:
-    get_approval_registry().remove_requirement(tool_name)
-    APPROVAL_REQUIRED_TOOLS.discard(tool_name)
-    TOOL_RISK_LEVELS.pop(tool_name, None)
-
+    reg = get_approval_registry()
+    reg.remove_requirement(tool_name)
+    reg._required_tools.discard(tool_name)
+    reg._risk_levels.pop(tool_name, None)
 
 def is_approval_required(tool_name: str) -> bool:
     return get_approval_registry().is_required(tool_name)
 
-
 def get_risk_level(tool_name: str) -> Optional[str]:
     return get_approval_registry().get_risk_level(tool_name)
-
 
 # ── Legacy console callback (kept for direct callers) ───────────────────────
 
@@ -157,18 +153,15 @@ def console_approval_callback(function_name: str, arguments: Dict, risk_level: s
     )
     return backend.request_approval_sync(request)
 
-
 # ── Legacy async request_approval ────────────────────────────────────────────
 
 async def request_approval(function_name: str, arguments: Dict) -> ApprovalDecision:
     """Request approval for a tool execution (legacy async API)."""
     return await get_approval_registry().approve_async(None, function_name, arguments)
 
-
 # ── require_approval decorator (unchanged semantics) ─────────────────────────
 
 RiskLevel = Literal["critical", "high", "medium", "low"]
-
 
 def require_approval(risk_level: RiskLevel = "high"):
     """Decorator to mark a tool as requiring human approval."""
@@ -176,8 +169,8 @@ def require_approval(risk_level: RiskLevel = "high"):
         tool_name = getattr(func, '__name__', str(func))
         reg = get_approval_registry()
         reg.add_requirement(tool_name, risk_level)
-        APPROVAL_REQUIRED_TOOLS.add(tool_name)
-        TOOL_RISK_LEVELS[tool_name] = risk_level
+        reg._required_tools.add(tool_name)
+        reg._risk_levels[tool_name] = risk_level
 
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -228,9 +221,7 @@ def require_approval(risk_level: RiskLevel = "high"):
 
     return decorator
 
-
 # ── PermissionAllowlist (kept as-is) ─────────────────────────────────────────
-
 
 @dataclass
 class ToolPermission:
@@ -238,7 +229,6 @@ class ToolPermission:
     tool_name: str
     allowed_paths: List[str] = field(default_factory=list)
     session_only: bool = False
-
 
 class PermissionAllowlist:
     """Persistent permission allowlist for tools."""
@@ -309,16 +299,13 @@ class PermissionAllowlist:
             allowlist.add_tool(tool_name, paths=tool_data.get("allowed_paths", []), session_only=tool_data.get("session_only", False))
         return allowlist
 
-
 _permission_allowlist: Optional[PermissionAllowlist] = None
-
 
 def get_permission_allowlist() -> PermissionAllowlist:
     global _permission_allowlist
     if _permission_allowlist is None:
         _permission_allowlist = PermissionAllowlist()
     return _permission_allowlist
-
 
 def set_permission_allowlist(allowlist: PermissionAllowlist) -> None:
     global _permission_allowlist

@@ -31,7 +31,7 @@ recipes:
   - my-recipe
   - another-recipe
 preload: true
-cors_origins: "*"
+cors_origins: "http://localhost:3000,http://localhost:8000"
 rate_limit: 100           # requests per minute (0 = disabled)
 max_request_size: 10485760  # 10MB default
 enable_metrics: false     # Enable /metrics endpoint
@@ -40,6 +40,7 @@ trace_exporter: none      # none, otlp, jaeger, zipkin
 ```
 """
 
+import hmac
 import json
 import os
 import time
@@ -332,7 +333,7 @@ def create_auth_middleware(auth_type: str, api_key: Optional[str] = None, jwt_se
                 # No key configured, allow request
                 return await call_next(request)
             
-            if provided_key != expected_key:
+            if not provided_key or not hmac.compare_digest(provided_key, expected_key):
                 return JSONResponse(
                     {"error": {"code": "unauthorized", "message": "Invalid or missing API key"}},
                     status_code=401

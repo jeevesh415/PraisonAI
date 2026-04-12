@@ -7,6 +7,7 @@ import asyncio
 import logging
 import signal
 import sys
+import os
 from typing import Dict, Optional, Set
 from dataclasses import dataclass
 
@@ -36,7 +37,7 @@ class BrowserServer:
     
     def __init__(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",  # Security: Default to localhost only
         port: int = 8765,
         model: str = "gpt-4o-mini",
         max_steps: int = 20,
@@ -45,12 +46,22 @@ class BrowserServer:
         """Initialize browser server.
         
         Args:
-            host: Host to bind to
+            host: Host to bind to (default: 127.0.0.1 for security)
             port: Port to listen on
             model: LLM model for browser agent
             max_steps: Maximum steps per session
             verbose: Enable verbose logging
         """
+        # Security: Require explicit opt-in for non-loopback binding
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            if os.environ.get("PRAISONAI_BROWSER_ALLOW_REMOTE", "").lower() != "true":
+                logger.warning(
+                    f"SECURITY: Blocking remote host '{host}'. "
+                    f"Set PRAISONAI_BROWSER_ALLOW_REMOTE=true to allow non-loopback binding. "
+                    f"Falling back to 127.0.0.1"
+                )
+                host = "127.0.0.1"
+        
         self.host = host
         self.port = port
         self.model = model
@@ -82,13 +93,37 @@ class BrowserServer:
             version="1.0.0",
         )
         
-        # Enable CORS for extension
+        # Configure CORS origins based on environment
+        cors_origins = os.getenv("BROWSER_CORS_ORIGINS", "").split(",")
+        cors_origins = [origin.strip() for origin in cors_origins if origin.strip() and origin.strip() != "*"]
+        
+        # Default secure origins if none specified
+        if not cors_origins:
+            # Environment-specific defaults for security
+            if os.getenv("ENVIRONMENT") == "production":
+                # In production, require explicit configuration
+                cors_origins = []
+            else:
+                # Development defaults - restrict to local origins
+                cors_origins = [
+                    "http://localhost:3000",  # Development frontend
+                    "http://localhost:8000",  # Local development
+                    "http://127.0.0.1:3000",  # Local development
+                    "http://127.0.0.1:8000",  # Local development
+                ]
+        
+        # Enable CORS for extension with secure origins.
+        # allow_origin_regex enables Chrome extension support since extension IDs
+        # (chrome-extension://<32-char-id>) cannot be listed as exact strings
+        # and the glob pattern chrome-extension://* is NOT supported by CORSMiddleware.
+        # Set BROWSER_CORS_ORIGINS to restrict to a specific extension ID.
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=cors_origins,
+            allow_origin_regex=r"chrome-extension://[a-z0-9]{32}",
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Origin", "Accept"],
         )
         
         @app.get("/health")
@@ -112,7 +147,50 @@ class BrowserServer:
         import json
         import time
         import uuid
+        import os
+        import re
         
+        # Use same CORS origins configuration for WebSocket validation
+        cors_origins = os.getenv("BROWSER_CORS_ORIGINS", "").split(",")
+        cors_origins = [origin.strip() for origin in cors_origins if origin.strip() and origin.strip() != "*"]
+        
+        if not cors_origins:
+            if os.getenv("ENVIRONMENT") == "production":
+                cors_origins = []
+            else:
+                cors_origins = [
+                    "http://localhost:3000", "http://localhost:8000",
+                    "http://127.0.0.1:3000", "http://127.0.0.1:8000"
+                ]
+        
+        origin = websocket.headers.get("origin")
+        
+        # Security: Reject connections without Origin header (unless from localhost CLI)
+        if not origin:
+            # Only allow missing Origin from localhost (CLI clients)
+            client_host = websocket.client.host if websocket.client else None
+            if client_host not in ("127.0.0.1", "localhost", "::1"):
+                logger.warning(f"[SECURITY] Rejecting WebSocket without Origin from {client_host}")
+                await websocket.close(code=1008)
+                return
+            logger.debug(f"[SECURITY] Allowing missing Origin from localhost {client_host}")
+        else:
+            import urllib.parse
+            parsed_origin = urllib.parse.urlparse(origin)
+            is_allowed = False
+            
+            # Check exact origin matches
+            if origin in cors_origins:
+                is_allowed = True
+            # Check chrome extension regex pattern (same as CORS middleware)
+            elif parsed_origin.scheme == "chrome-extension" and re.match(r"chrome-extension://[a-z0-9]{32}", origin):
+                is_allowed = True
+            
+            if not is_allowed:
+                logger.warning(f"[SECURITY] Rejecting WebSocket with invalid Origin: {origin}")
+                await websocket.close(code=1008)
+                return
+
         await websocket.accept()
         
         # Create connection tracking

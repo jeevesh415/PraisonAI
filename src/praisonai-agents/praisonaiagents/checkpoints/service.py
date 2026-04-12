@@ -7,6 +7,7 @@ Implements shadow git repository for file-level checkpointing.
 import os
 import asyncio
 import logging
+from praisonaiagents._logging import get_logger
 import shutil
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
@@ -17,8 +18,7 @@ from .types import (
     CheckpointResult, CheckpointEvent
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _parse_iso_timestamp(timestamp: str) -> datetime:
     """Parse ISO format timestamp, handling 'Z' suffix for Python 3.9 compatibility."""
@@ -38,7 +38,6 @@ PROTECTED_PATHS = [
     "/var",
     "/etc",
 ]
-
 
 class CheckpointService:
     """
@@ -71,7 +70,9 @@ class CheckpointService:
         storage_dir: Optional[str] = None,
         enabled: bool = True,
         auto_checkpoint: bool = True,
-        max_checkpoints: int = 100
+        max_checkpoints: int = 100,
+        user_name: str = "PraisonAI Checkpoints",
+        user_email: str = "checkpoints@praison.ai"
     ):
         """
         Initialize the checkpoint service.
@@ -82,13 +83,17 @@ class CheckpointService:
             enabled: Whether checkpoints are enabled
             auto_checkpoint: Auto-checkpoint before file modifications
             max_checkpoints: Maximum checkpoints to keep
+            user_name: Git user.name for commits (default: "PraisonAI Checkpoints")
+            user_email: Git user.email for commits (default: "checkpoints@praison.ai")
         """
         self.config = CheckpointConfig(
             workspace_dir=workspace_dir,
             storage_dir=storage_dir,
             enabled=enabled,
             auto_checkpoint=auto_checkpoint,
-            max_checkpoints=max_checkpoints
+            max_checkpoints=max_checkpoints,
+            user_name=user_name,
+            user_email=user_email
         )
         
         self._initialized = False
@@ -174,9 +179,9 @@ class CheckpointService:
             # Initialize git repo
             await self._run_git("init")
             
-            # Configure git
-            await self._run_git("config", "user.name", "PraisonAI Checkpoints")
-            await self._run_git("config", "user.email", "checkpoints@praison.ai")
+            # Configure git with user-provided or default identity
+            await self._run_git("config", "user.name", self.config.user_name)
+            await self._run_git("config", "user.email", self.config.user_email)
             
             # Set worktree to workspace
             await self._run_git("config", "core.worktree", self.config.workspace_dir)
@@ -218,7 +223,11 @@ class CheckpointService:
             cwd=self.config.workspace_dir
         )
         
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            process.kill()
+            raise RuntimeError(f"Git command timed out after 30 seconds: {' '.join(args)}")
         
         if process.returncode != 0:
             error_msg = stderr.decode().strip()

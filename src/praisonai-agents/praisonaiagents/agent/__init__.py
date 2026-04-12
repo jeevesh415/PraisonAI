@@ -1,4 +1,12 @@
-"""Agent module for AI agents - uses lazy loading for performance"""
+"""Agent module for AI agents - uses lazy loading for performance
+
+The Agent class has been decomposed into focused modules for better maintainability:
+- tool_execution: Tool calling and execution functionality  
+- chat_handler: Chat and conversation management
+- session_manager: Session persistence and state management
+
+Backward compatibility is maintained via mixins in the main Agent class.
+"""
 
 # Lazy loading cache
 _lazy_cache = {}
@@ -13,6 +21,18 @@ def __getattr__(name):
         from .agent import Agent
         _lazy_cache[name] = Agent
         return Agent
+    if name == 'BudgetExceededError':
+        from .agent import BudgetExceededError
+        _lazy_cache[name] = BudgetExceededError
+        return BudgetExceededError
+    if name == 'Heartbeat':
+        from .heartbeat import Heartbeat
+        _lazy_cache[name] = Heartbeat
+        return Heartbeat
+    if name == 'HeartbeatConfig':
+        from .heartbeat import HeartbeatConfig
+        _lazy_cache[name] = HeartbeatConfig
+        return HeartbeatConfig
     
     # Specialized agents - lazy loaded (import rich)
     if name == 'ImageAgent':
@@ -90,7 +110,7 @@ def __getattr__(name):
     
     # Handoff - lightweight
     _handoff_names = {
-        'Handoff', 'handoff', 'handoff_filters', 
+        'Handoff', 'handoff', 'handoff_filters', 'parallel_handoffs',
         'RECOMMENDED_PROMPT_PREFIX', 'prompt_with_handoff_instructions',
         'HandoffConfig', 'HandoffResult', 'HandoffInputData',
         'ContextPolicy', 'HandoffError', 'HandoffCycleError', 
@@ -141,10 +161,39 @@ def __getattr__(name):
         _lazy_cache[name] = value
         return value
     
+    # Decomposed mixins - for advanced use cases
+    if name == 'ToolExecutionMixin':
+        from .tool_execution import ToolExecutionMixin
+        _lazy_cache[name] = ToolExecutionMixin
+        return ToolExecutionMixin
+    elif name == 'ChatHandlerMixin':
+        from .chat_handler import ChatHandlerMixin
+        _lazy_cache[name] = ChatHandlerMixin
+        return ChatHandlerMixin
+    elif name == 'SessionManagerMixin':
+        from .session_manager import SessionManagerMixin
+        _lazy_cache[name] = SessionManagerMixin
+        return SessionManagerMixin
+    elif name == 'ChatMixin':
+        from .chat_mixin import ChatMixin
+        _lazy_cache[name] = ChatMixin
+        return ChatMixin
+    elif name == 'ExecutionMixin':
+        from .execution_mixin import ExecutionMixin
+        _lazy_cache[name] = ExecutionMixin
+        return ExecutionMixin
+    elif name == 'MemoryMixin':
+        from .memory_mixin import MemoryMixin
+        _lazy_cache[name] = MemoryMixin
+        return MemoryMixin
+    
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     'Agent',
+    'BudgetExceededError',
+    'Heartbeat',
+    'HeartbeatConfig',
     'ImageAgent',
     'VideoAgent',
     'VideoConfig',
@@ -165,6 +214,7 @@ __all__ = [
     'Handoff',
     'handoff',
     'handoff_filters',
+    'parallel_handoffs',
     'RECOMMENDED_PROMPT_PREFIX',
     'prompt_with_handoff_instructions',
     'HandoffConfig',
@@ -198,4 +248,11 @@ __all__ = [
     'MemoryAwareAgentProtocol',
     'FullAgentProtocol',
     'ContextEngineerProtocol',
+    # Decomposed mixins (for advanced use cases)
+    'ToolExecutionMixin',
+    'ChatHandlerMixin',
+    'SessionManagerMixin',
+    'ChatMixin',
+    'ExecutionMixin',
+    'MemoryMixin',
 ]

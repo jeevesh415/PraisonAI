@@ -4,6 +4,7 @@ import sys
 import argparse
 import warnings
 import os
+import json
 
 # Suppress Pydantic serialization warnings from LiteLLM BEFORE any imports
 # These warnings occur when LiteLLM's response objects have field mismatches
@@ -66,6 +67,56 @@ import importlib
 # from praisonai.agents_generator import AgentsGenerator  # Lazy: imported when running agents
 # REMOVED: from praisonai.inbuilt_tools import * - causes ~3200ms crewai import
 # REMOVED: from praisonai.inc.config import generate_config - causes ~3500ms langchain import
+
+
+# Security: blocklist of environment variable keys that must not be set from
+# untrusted YAML config files. These keys can alter code-loading behaviour
+# (LD_PRELOAD, PYTHONPATH, …) or redirect subprocesses (PATH) and are
+# therefore a vector for arbitrary code execution (CWE-78).
+_BLOCKED_ENV_KEYS = frozenset({
+    # Dynamic linker injection
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    # Executable / module search paths
+    "PATH",
+    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+    "NODE_PATH", "NODE_OPTIONS",
+    "RUBYLIB", "PERL5LIB", "PERL5OPT",
+    "CLASSPATH",
+    # Proxy / redirect (could exfiltrate traffic)
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    # Miscellaneous dangerous keys
+    "BASH_ENV", "ENV", "CDPATH",
+    "PROMPT_COMMAND",
+    "SHLVL",
+})
+
+# Pre-compute uppercase lookup set once at module load (avoids rebuilding per call)
+_BLOCKED_ENV_KEYS_UPPER = frozenset(k.upper() for k in _BLOCKED_ENV_KEYS)
+
+
+def _validate_env_key(key) -> None:
+    """Raise ``ValueError`` if *key* is a blocked environment variable name.
+
+    The check is case-insensitive so that ``ld_preload`` is caught as well as
+    ``LD_PRELOAD``.  Non-string keys (e.g. YAML integer or null keys) are
+    rejected with a clear validation error.
+    """
+    if not isinstance(key, str):
+        raise ValueError(
+            f"Environment variable key must be a string, got {type(key).__name__}: {key!r}"
+        )
+    if not key or "=" in key or "\x00" in key:
+        raise ValueError(
+            "Environment variable key must be a non-empty string without '=' or NUL characters."
+        )
+    if key.upper() in _BLOCKED_ENV_KEYS_UPPER:
+        raise ValueError(
+            f"Setting environment variable '{key}' is not allowed in schedule "
+            f"config files because it can be used to execute arbitrary code."
+        )
+
 
 # Lazy import helpers for inbuilt_tools and config
 def _get_inbuilt_tools():
@@ -444,20 +495,37 @@ class PraisonAI:
                     try:
                         with open(args.schedule_config, 'r') as f:
                             file_config = yaml.safe_load(f)
+                        if file_config is None:
+                            file_config = {}
+                        if not isinstance(file_config, dict):
+                            raise ValueError("Schedule config must be a YAML mapping")
                         
                         # Extract deployment config
                         deploy_config = file_config.get('deployment', {})
+                        if deploy_config is None:
+                            deploy_config = {}
+                        if not isinstance(deploy_config, dict):
+                            raise ValueError("'deployment' must be a mapping")
                         schedule_expr = schedule_expr or deploy_config.get('schedule')
                         provider = deploy_config.get('provider', provider)
                         config['max_retries'] = deploy_config.get('max_retries', config['max_retries'])
                         
                         # Apply environment variables if specified
                         env_vars = file_config.get('environment', {})
+                        if not isinstance(env_vars, dict):
+                            raise ValueError("'environment' must be a mapping of KEY: value pairs")
+                        # Validate all keys first (fail-closed) before mutating os.environ
+                        validated_env = {}
                         for key, value in env_vars.items():
-                            os.environ[key] = str(value)
+                            _validate_env_key(key)
+                            validated_env[key] = str(value)
+                        os.environ.update(validated_env)
                             
                     except FileNotFoundError:
                         print(f"Configuration file not found: {args.schedule_config}")
+                        sys.exit(1)
+                    except ValueError as e:
+                        print(f"Invalid schedule configuration: {e}")
                         sys.exit(1)
                     except yaml.YAMLError as e:
                         print(f"Error parsing configuration file: {e}")
@@ -635,7 +703,9 @@ class PraisonAI:
             generator = AutoGenerator(topic=self.topic, framework=self.framework, agent_file=self.agent_file)
             self.agent_file = generator.generate(merge=getattr(args, 'merge', False))
             AgentsGenerator = _get_agents_generator()
-            agents_generator = AgentsGenerator(self.agent_file, self.framework, self.config_list)
+            # Extract CLI configuration for YAML CLI parity
+            cli_config = self._extract_cli_config_for_yaml()
+            agents_generator = AgentsGenerator(self.agent_file, self.framework, self.config_list, cli_config=cli_config)
             result = agents_generator.generate_crew_and_kickoff()
             print(result)
             return result
@@ -660,12 +730,15 @@ class PraisonAI:
             else:
                 # Modify code to allow default UI
                 AgentsGenerator = _get_agents_generator()
+                # Extract CLI configuration for YAML CLI parity
+                cli_config = self._extract_cli_config_for_yaml()
                 agents_generator = AgentsGenerator(
                     self.agent_file,
                     self.framework,
                     self.config_list,
                     agent_yaml=self.agent_yaml,
-                    tools=self.tools
+                    tools=self.tools,
+                    cli_config=cli_config
                 )
                 result = agents_generator.generate_crew_and_kickoff()
                 print(result)
@@ -728,12 +801,15 @@ class PraisonAI:
             
             try:
                 AgentsGenerator = _get_agents_generator()
+                # Extract CLI configuration for YAML CLI parity 
+                cli_config = self._extract_cli_config_for_yaml()
                 agents_generator = AgentsGenerator(
                     self.agent_file,
                     self.framework,
                     self.config_list,
                     agent_yaml=self.agent_yaml,
-                    tools=self.tools
+                    tools=self.tools,
+                    cli_config=cli_config
                 )
                 result = agents_generator.generate_crew_and_kickoff()
                 print(result)
@@ -805,7 +881,7 @@ class PraisonAI:
             return default_args
         
         # Define special commands
-        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw']
+        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed']
         
         parser = argparse.ArgumentParser(prog="praisonai", description="praisonAI command-line interface")
         parser.add_argument("--framework", choices=["crewai", "autogen", "praisonai"], help="Specify the framework")
@@ -853,6 +929,8 @@ class PraisonAI:
         parser.add_argument("--web", "--web-search", action="store_true", help="Enable native web search (OpenAI, Gemini, Anthropic, xAI, Perplexity)")
         parser.add_argument("--web-fetch", action="store_true", help="Enable web fetch to retrieve URL content (Anthropic only)")
         parser.add_argument("--prompt-caching", action="store_true", help="Enable prompt caching to reduce costs (OpenAI, Anthropic, Bedrock, Deepseek)")
+        parser.add_argument("--stream", action="store_true", help="Enable real-time streaming for agent responses")
+        parser.add_argument("--stream-metrics", action="store_true", help="Enable streaming with token metrics display")
         
         # Planning Mode arguments
         parser.add_argument("--planning", action="store_true", help="Enable planning mode - create plan before execution")
@@ -886,6 +964,7 @@ class PraisonAI:
         
         # Metrics - token/cost tracking
         parser.add_argument("--metrics", action="store_true", help="Display token usage and cost metrics")
+        parser.add_argument("--metrics-json", action="store_true", help="Output structured cost and token data as JSON")
         
         # Image Description (Vision) - analyze existing images
         parser.add_argument("--image", type=str, help="Path to image file for vision-based description/analysis")
@@ -1054,7 +1133,8 @@ class PraisonAI:
         if args.command == 'api:app' or args.command == '/app/api:app':
             args.command = 'agents.yaml'
         if args.command == 'ui':
-            args.ui = 'chainlit'
+            # UI command — routes to Typer CLI for clean chat UI (praisonaiui)
+            pass
         # chat and code commands are now terminal-native (handled by Typer commands)
         # They no longer set args.ui = 'chainlit' or open browser
         
@@ -1163,11 +1243,16 @@ class PraisonAI:
                 config_yaml_destination = os.path.join(os.getcwd(), 'config.yaml')
 
             elif args.command == 'ui':
-                if not CHAINLIT_AVAILABLE:
-                    print("[red]ERROR: UI is not installed. Install with:[/red]")
-                    print("\npip install \"praisonai[ui]\"\n")
-                    sys.exit(1)
-                self.create_chainlit_interface()
+                # UI command — Clean Chat UI (praisonaiui)
+                # Routes to Typer CLI for ui command (launches clean chat)
+                from .app import app as typer_app, register_commands
+                register_commands()
+                import sys as _sys
+                _sys.argv = ['praisonai', 'ui'] + unknown_args
+                try:
+                    typer_app()
+                except SystemExit as e:
+                    sys.exit(e.code if e.code else 0)
                 sys.exit(0)
 
             elif args.command == 'context':
@@ -1463,6 +1548,12 @@ class PraisonAI:
                 # Run command - async jobs API for long-running tasks
                 from .features.jobs import handle_run_command
                 handle_run_command(unknown_args, verbose=getattr(args, 'verbose', False))
+                sys.exit(0)
+            
+            elif args.command == 'managed':
+                # Managed agents — delegate to Typer app
+                from .commands.managed import app as managed_app
+                managed_app(unknown_args)
                 sys.exit(0)
             
             elif args.command == 'thinking':
@@ -3550,8 +3641,16 @@ class PraisonAI:
         """
         try:
             import subprocess
+            import os
             from rich import print
             from praisonaiagents import Agent
+            
+            # Get custom git author from environment variables
+            git_user_name = os.getenv("PRAISONAI_GIT_USER_NAME")
+            git_user_email = os.getenv("PRAISONAI_GIT_USER_EMAIL")
+            git_author = None
+            if git_user_name and git_user_email:
+                git_author = f"{git_user_name} <{git_user_email}>"
             
             # Check if we're in a git repository
             try:
@@ -3676,7 +3775,10 @@ Do NOT add any explanations or formatting."""
             
             # In auto mode, skip confirmation and commit + push
             if auto_mode:
-                subprocess.run(["git", "commit", "-m", commit_message], check=True)
+                commit_cmd = ["git", "commit", "-m", commit_message]
+                if git_author:
+                    commit_cmd.extend(["--author", git_author])
+                subprocess.run(commit_cmd, check=True)
                 print("[green]✅ Committed successfully![/green]")
                 subprocess.run(["git", "push"], check=True)
                 print("[green]✅ Pushed to remote![/green]")
@@ -3692,7 +3794,10 @@ Do NOT add any explanations or formatting."""
             
             if choice == 'y':
                 # Commit with the generated message
-                subprocess.run(["git", "commit", "-m", commit_message], check=True)
+                commit_cmd = ["git", "commit", "-m", commit_message]
+                if git_author:
+                    commit_cmd.extend(["--author", git_author])
+                subprocess.run(commit_cmd, check=True)
                 print("[green]✅ Committed successfully![/green]")
                 
                 # Check if --push was passed
@@ -3716,7 +3821,10 @@ Do NOT add any explanations or formatting."""
                 os.unlink(temp_path)
                 
                 if edited_message:
-                    subprocess.run(["git", "commit", "-m", edited_message], check=True)
+                    commit_cmd = ["git", "commit", "-m", edited_message]
+                    if git_author:
+                        commit_cmd.extend(["--author", git_author])
+                    subprocess.run(commit_cmd, check=True)
                     print("[green]✅ Committed successfully![/green]")
                 else:
                     print("[yellow]Empty message, commit cancelled.[/yellow]")
@@ -3881,6 +3989,71 @@ Do NOT add any explanations or formatting."""
         
         return results[-1].get("output", "") if results else ""
 
+    def _extract_cli_config_for_yaml(self):
+        """
+        Extract CLI configuration that should be passed to YAML processing.
+        
+        Returns:
+            dict: CLI configuration for the missing CLI parity features
+        """
+        if not hasattr(self, 'args'):
+            return {}
+            
+        cli_config = {}
+        
+        # Extract --trust flag
+        if getattr(self.args, 'trust', False):
+            cli_config['trust'] = True
+            
+        # Extract --tool-timeout flag  
+        tool_timeout = getattr(self.args, 'tool_timeout', None)
+        if tool_timeout is not None:
+            cli_config['tool_timeout'] = tool_timeout
+            
+        # Extract --planning-tools flag
+        planning_tools = getattr(self.args, 'planning_tools', None)
+        if planning_tools:
+            cli_config['planning_tools'] = planning_tools
+            
+        # Extract --acp flag
+        if getattr(self.args, 'acp', False):
+            cli_config['acp'] = True
+            
+        # Extract --lsp flag
+        if getattr(self.args, 'lsp', False):
+            cli_config['lsp'] = True
+            
+        # Extract new agent-level CLI flags for YAML parity
+        autonomy = getattr(self.args, 'autonomy', None)
+        if autonomy is not None:
+            cli_config['autonomy'] = autonomy
+            
+        guardrail = getattr(self.args, 'guardrail', None)
+        if guardrail is not None:
+            cli_config['guardrail'] = guardrail
+            
+        approval = getattr(self.args, 'approval', None)
+        if approval is not None:
+            cli_config['approval'] = approval
+            
+        approve_all_tools = getattr(self.args, 'approve_all_tools', None)
+        if approve_all_tools is not None:
+            cli_config['approve_all_tools'] = approve_all_tools
+            
+        approval_timeout = getattr(self.args, 'approval_timeout', None)
+        if approval_timeout is not None:
+            cli_config['approval_timeout'] = approval_timeout
+            
+        # Extract streaming configuration for YAML CLI parity
+        stream = getattr(self.args, 'stream', False)
+        stream_metrics = getattr(self.args, 'stream_metrics', False)
+        if stream or stream_metrics:
+            cli_config['stream'] = stream or stream_metrics
+            if stream_metrics:
+                cli_config['stream_metrics'] = True
+            
+        return cli_config
+
     def handle_direct_prompt(self, prompt):
         """
         Handle direct prompt by creating a single agent and running it.
@@ -3999,12 +4172,15 @@ Do NOT add any explanations or formatting."""
             
             # Add feature flags if enabled
             if hasattr(self, 'args'):
-                if getattr(self.args, 'web_search', False):
-                    agent_config["web_search"] = True
-                if getattr(self.args, 'web_fetch', False):
-                    agent_config["web_fetch"] = True
+                if getattr(self.args, 'web_search', False) or getattr(self.args, 'web_fetch', False):
+                    from praisonaiagents.config.web_config import WebConfig
+                    agent_config["web"] = WebConfig(
+                        search=getattr(self.args, 'web_search', False),
+                        fetch=getattr(self.args, 'web_fetch', False),
+                    )
                 if getattr(self.args, 'prompt_caching', False):
-                    agent_config["prompt_caching"] = True
+                    from praisonaiagents import CachingConfig
+                    agent_config["caching"] = CachingConfig(prompt_caching=True)
                 
                 # Load tools if specified (--tools flag)
                 if getattr(self.args, 'tools', None):
@@ -4020,21 +4196,24 @@ Do NOT add any explanations or formatting."""
                 
                 # Planning Mode
                 if getattr(self.args, 'planning', False):
-                    agent_config["planning"] = True
+                    from praisonaiagents import PlanningConfig
+                    planning_kwargs = {}
                     print("[bold cyan]Planning mode enabled - agent will create a plan before execution[/bold cyan]")
                     
                     # Load planning tools if specified
                     if getattr(self.args, 'planning_tools', None):
                         planning_tools_list = self._load_tools(self.args.planning_tools)
                         if planning_tools_list:
-                            agent_config["planning_tools"] = planning_tools_list
+                            planning_kwargs["tools"] = planning_tools_list
                     # If no planning_tools but --tools is specified, use those for planning too
                     elif getattr(self.args, 'tools', None) and agent_config.get('tools'):
-                        agent_config["planning_tools"] = agent_config['tools']
+                        planning_kwargs["tools"] = agent_config['tools']
                         print("[cyan]Using --tools for planning as well[/cyan]")
                     
                     if getattr(self.args, 'planning_reasoning', False):
-                        agent_config["planning_reasoning"] = True
+                        planning_kwargs["reasoning"] = True
+                    
+                    agent_config["planning"] = PlanningConfig(**planning_kwargs) if planning_kwargs else True
                 
                 # P8/G11: Tool timeout - prevent slow tools from blocking
                 tool_timeout = getattr(self.args, 'tool_timeout', 60)
@@ -4043,20 +4222,26 @@ Do NOT add any explanations or formatting."""
                 
                 # Memory
                 if getattr(self.args, 'memory', False):
-                    agent_config["memory"] = True
-                    print("[bold cyan]Memory enabled - agent will remember context across sessions[/bold cyan]")
-                    
+                    memory_kwargs = {}
                     if getattr(self.args, 'user_id', None):
-                        agent_config["user_id"] = self.args.user_id
-                
-                # Session management
-                if getattr(self.args, 'auto_save', None):
-                    agent_config["memory"] = True  # Auto-save requires memory
-                    agent_config["auto_save"] = self.args.auto_save
+                        memory_kwargs["user_id"] = self.args.user_id
+                    if getattr(self.args, 'auto_save', None):
+                        memory_kwargs["auto_save"] = self.args.auto_save
+                        print(f"[bold cyan]Auto-save enabled - session will be saved as '{self.args.auto_save}'[/bold cyan]")
+                    if memory_kwargs:
+                        from praisonaiagents import MemoryConfig
+                        agent_config["memory"] = MemoryConfig(**memory_kwargs)
+                    else:
+                        agent_config["memory"] = True
+                    print("[bold cyan]Memory enabled - agent will remember context across sessions[/bold cyan]")
+                elif getattr(self.args, 'auto_save', None):
+                    from praisonaiagents import MemoryConfig
+                    agent_config["memory"] = MemoryConfig(auto_save=self.args.auto_save)
                     print(f"[bold cyan]Auto-save enabled - session will be saved as '{self.args.auto_save}'[/bold cyan]")
                 
                 if getattr(self.args, 'history', None):
-                    agent_config["memory"] = True  # History requires memory
+                    if agent_config.get("memory") is None:
+                        agent_config["memory"] = True  # History requires memory
                     # Note: history_in_context param removed - history loading now via context= param
                     print(f"[bold cyan]History enabled - loading context from last {self.args.history} session(s)[/bold cyan]")
                 
@@ -4064,7 +4249,12 @@ Do NOT add any explanations or formatting."""
                 if getattr(self.args, 'claude_memory', False):
                     llm = getattr(self.args, 'llm', '')
                     if llm and 'anthropic' in llm.lower():
-                        agent_config["claude_memory"] = True
+                        from praisonaiagents import MemoryConfig
+                        existing_memory = agent_config.get("memory")
+                        if isinstance(existing_memory, MemoryConfig):
+                            existing_memory.claude_memory = True
+                        else:
+                            agent_config["memory"] = MemoryConfig(claude_memory=True)
                         print("[bold cyan]Claude Memory Tool enabled - Claude will autonomously manage memories[/bold cyan]")
                     else:
                         print("[yellow]Warning: --claude-memory requires an Anthropic model (--llm anthropic/...)[/yellow]")
@@ -4127,7 +4317,8 @@ Do NOT add any explanations or formatting."""
                 
                 # Metrics - Token/cost tracking (display happens AFTER execution)
                 if getattr(self.args, 'metrics', False):
-                    agent_config["metrics"] = True
+                    from praisonaiagents import OutputConfig
+                    agent_config["output"] = OutputConfig(metrics=True)
                 
                 # Telemetry - Usage monitoring
                 if getattr(self.args, 'telemetry', False):
@@ -4570,6 +4761,33 @@ Now, {final_instruction.lower()}:"""
             if hasattr(self, 'args') and getattr(self.args, 'save', False):
                 self._save_output(prompt, result)
             
+            # Metrics JSON - Output structured cost data
+            if hasattr(self, 'args') and getattr(self.args, 'metrics_json', False):
+                try:
+                    from .features.metrics import MetricsHandler
+                    _mh = MetricsHandler(verbose=getattr(self.args, 'verbose', False))
+                    # Extract from final_agent if it was used, otherwise from original agent
+                    active_agent = final_agent if 'final_agent' in locals() else agent
+                    agent_metrics = _mh.extract_metrics_from_agent(active_agent)
+                    # Resolve model name: prefer what the agent reported, fall back to config
+                    model_name = agent_metrics.get('model')
+                    if not model_name:
+                        model_name = agent_config.get('llm', 'unknown')
+                        if isinstance(model_name, dict):
+                            model_name = model_name.get('model', 'unknown')
+                    metrics_out = {
+                        "cost_usd": agent_metrics.get('cost', 0.0),
+                        "tokens_in": agent_metrics.get('prompt_tokens', 0),
+                        "tokens_out": agent_metrics.get('completion_tokens', 0),
+                        "model": model_name or 'unknown',
+                        "request_count": agent_metrics.get('llm_calls', 0),
+                    }
+                    print(json.dumps(metrics_out))
+                except Exception as exc:
+                    print(f"[metrics-json] warning: could not extract metrics: {exc}", file=sys.stderr)
+                    # CRITICAL: Always emit JSON when --metrics-json is set
+                    print(json.dumps({"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "model": "unknown", "request_count": 0}))
+            
             return result
         elif CREWAI_AVAILABLE:
             from crewai import Agent, Task, Crew
@@ -4728,7 +4946,7 @@ Now, {final_instruction.lower()}:"""
             praisonai agents.yaml --serve
         """
         import yaml
-        from praisonaiagents import Agent, Agents
+        from praisonaiagents import Agent, AgentTeam
         
         # Determine the YAML file path
         yaml_file = None
@@ -4979,7 +5197,9 @@ Now, {final_instruction.lower()}:"""
                 generator = AutoGenerator(topic=auto_args, framework=self.framework)
                 self.agent_file = generator.generate()
                 AgentsGenerator = _get_agents_generator()
-                agents_generator = AgentsGenerator(self.agent_file, self.framework, self.config_list)
+                # Extract CLI configuration for YAML CLI parity
+                cli_config = self._extract_cli_config_for_yaml()
+                agents_generator = AgentsGenerator(self.agent_file, self.framework, self.config_list, cli_config=cli_config)
                 result = agents_generator.generate_crew_and_kickoff()
                 return result
 
@@ -5165,7 +5385,7 @@ Now, {final_instruction.lower()}:"""
             
             # If tools are provided, use Agent with tools first, then DeepResearchAgent
             if tools_list:
-                from praisonaiagents import Agent, Task, Agents
+                from praisonaiagents import Agent, Task, AgentTeam
                 
                 # Create a research assistant agent with tools
                 research_assistant = Agent(

@@ -91,6 +91,23 @@ def _check_autogen_v4_available() -> bool:
     return _autogen_v4_available
 
 
+# --- AG2 lazy loading ---
+_ag2_available = None
+
+def _check_ag2_available() -> bool:
+    """Check if AG2 (community fork of AutoGen) is available (cached)."""
+    global _ag2_available
+    if _ag2_available is None:
+        try:
+            import importlib.metadata
+            importlib.metadata.distribution('ag2')
+            from autogen import LLMConfig  # noqa: F401 — AG2-exclusive class
+            _ag2_available = True
+        except Exception:
+            _ag2_available = False
+    return _ag2_available
+
+
 def _get_autogen():
     """Lazy load autogen module."""
     global _autogen_module
@@ -127,7 +144,7 @@ def _get_praisonai():
     """Lazy load praisonaiagents classes."""
     global _praisonai_classes
     if _praisonai_classes is None:
-        from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, Agents
+        from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam
         _praisonai_classes = (PraisonAgent, PraisonTask, Agents)
     return _praisonai_classes
 
@@ -657,6 +674,11 @@ AutoGen is not installed. Please install with:
             raise ImportError("""
 Praisonai is not installed. Please install with:
     pip install praisonaiagents
+""")
+        elif framework == "ag2" and not _check_ag2_available():
+            raise ImportError("""
+AG2 is not installed. Please install with:
+    pip install "praisonai[ag2]"
 """)
 
         # Only show tools message if using a framework and tools are needed

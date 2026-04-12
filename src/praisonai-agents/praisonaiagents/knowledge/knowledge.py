@@ -1,11 +1,12 @@
 import os
 import logging
+from praisonaiagents._logging import get_logger
 from datetime import datetime
 from .chunking import Chunking
 from functools import cached_property
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__)
 
 class CustomMemory:
     @classmethod
@@ -46,333 +47,8 @@ class CustomMemory:
             "event": "ADD"
         }]
 
-class MongoDBMemory:
-    """MongoDB-based memory store for knowledge management."""
-    
-    def __init__(self, config):
-        self.config = config
-        self.vector_store_config = config.get("vector_store", {}).get("config", {})
-        self.connection_string = self.vector_store_config.get("connection_string", "mongodb://localhost:27017/")
-        self.database_name = self.vector_store_config.get("database", "praisonai")
-        self.collection_name = self.vector_store_config.get("collection", "knowledge_base")
-        self.use_vector_search = self.vector_store_config.get("use_vector_search", True)
-        
-        # Initialize embedding model before MongoDB to ensure embedding_model_name is available
-        self._init_embedding_model()
-        
-        # Initialize MongoDB client
-        self._init_mongodb()
-    
-    def _init_mongodb(self):
-        """Initialize MongoDB client and collection."""
-        try:
-            from pymongo import MongoClient
-            
-            self.client = MongoClient(
-                self.connection_string,
-                maxPoolSize=50,
-                retryWrites=True,
-                retryReads=True
-            )
-            
-            # Test connection
-            self.client.admin.command('ping')
-            
-            # Setup database and collection
-            self.db = self.client[self.database_name]
-            self.collection = self.db[self.collection_name]
-            
-            # Create indexes
-            self._create_indexes()
-            
-        except Exception as e:
-            raise Exception(f"Failed to initialize MongoDB: {e}")
-    
-    def _init_embedding_model(self):
-        """Initialize embedding model from config using litellm for unified provider support."""
-        try:
-            # Set up embedding model based on config
-            embedder_config = self.config.get("embedder", {})
-            provider = embedder_config.get("provider", "openai")
-            model_name = embedder_config.get("config", {}).get("model", "text-embedding-3-small")
-            
-            # Store model name for later use
-            self.embedding_model_name = model_name
-            
-            # Use litellm for embeddings - it handles all providers uniformly
-            # We'll use litellm.embedding() in _get_embeddings() instead of storing a client
-            self.embedding_provider = provider
-            self.embedding_model = None  # Will use litellm.embedding() directly
-        except Exception as e:
-            raise Exception(f"Failed to initialize embedding model: {e}")
-    
-    def _get_embedding_dimensions(self, model_name: str) -> int:
-        """Get embedding dimensions based on model name."""
-        from praisonaiagents.embedding import get_dimensions
-        return get_dimensions(model_name)
-    
-    def _create_indexes(self):
-        """Create necessary indexes for MongoDB."""
-        try:
-            # Text search index
-            self.collection.create_index([("content", "text")])
-            
-            # Metadata indexes
-            self.collection.create_index([("metadata.filename", 1)])
-            self.collection.create_index([("created_at", -1)])
-            
-            # Vector search index for Atlas (if enabled)
-            if self.use_vector_search:
-                self._create_vector_index()
-                
-        except Exception as e:
-            logging.warning(f"Could not create MongoDB indexes: {e}")
-    
-    def _create_vector_index(self):
-        """Create vector search index for Atlas Vector Search."""
-        try:
-            vector_index_def = {
-                "mappings": {
-                    "dynamic": True,
-                    "fields": {
-                        "embedding": {
-                            "type": "knnVector",
-                            "dimensions": self._get_embedding_dimensions(self.embedding_model_name),
-                            "similarity": "cosine"
-                        }
-                    }
-                }
-            }
-            
-            # Use SearchIndexModel for PyMongo 4.6+ compatibility
-            try:
-                from pymongo.operations import SearchIndexModel
-                search_index_model = SearchIndexModel(definition=vector_index_def, name="vector_index")
-                self.collection.create_search_index(search_index_model)
-            except ImportError:
-                # Fallback for older PyMongo versions
-                self.collection.create_search_index(vector_index_def, "vector_index")
-            
-        except Exception as e:
-            logging.warning(f"Could not create vector search index: {e}")
-    
-    def _get_embedding(self, text):
-        """Get embedding for text using the unified embedding module."""
-        try:
-            from praisonaiagents.embedding import embedding
-            result = embedding(text, model=self.embedding_model_name)
-            return result.embeddings[0] if result.embeddings else None
-        except Exception as e:
-            logging.error(f"Error getting embedding: {e}")
-            return None
-    
-    def add(self, messages, user_id=None, agent_id=None, run_id=None, metadata=None):
-        """Add memory to MongoDB."""
-        try:
-            # Handle different message formats
-            if isinstance(messages, list):
-                content = "\n".join([msg.get("content", str(msg)) if isinstance(msg, dict) else str(msg) for msg in messages])
-            else:
-                content = str(messages)
-            
-            # Generate embedding
-            embedding = self._get_embedding(content) if self.use_vector_search else None
-            
-            # Create document
-            doc = {
-                "content": content,
-                "metadata": metadata or {},
-                "user_id": user_id,
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "created_at": datetime.utcnow(),
-                "memory_type": "knowledge"
-            }
-            
-            if embedding:
-                doc["embedding"] = embedding
-            
-            # Insert document
-            result = self.collection.insert_one(doc)
-            
-            return [{
-                "id": str(result.inserted_id),
-                "memory": content,
-                "event": "ADD"
-            }]
-            
-        except Exception as e:
-            logging.error(f"Error adding memory to MongoDB: {e}")
-            return []
-    
-    def search(self, query, user_id=None, agent_id=None, run_id=None, rerank=False, **kwargs):
-        """Search memories in MongoDB."""
-        try:
-            results = []
-            
-            # Vector search if enabled
-            if self.use_vector_search:
-                embedding = self._get_embedding(query)
-                if embedding:
-                    pipeline = [
-                        {
-                            "$vectorSearch": {
-                                "index": "vector_index",
-                                "path": "embedding",
-                                "queryVector": embedding,
-                                "numCandidates": kwargs.get("limit", 10) * 10,
-                                "limit": kwargs.get("limit", 10)
-                            }
-                        },
-                        {
-                            "$addFields": {
-                                "score": {"$meta": "vectorSearchScore"}
-                            }
-                        }
-                    ]
-                    
-                    # Add filters if provided
-                    if user_id or agent_id or run_id:
-                        match_filter = {}
-                        if user_id:
-                            match_filter["user_id"] = user_id
-                        if agent_id:
-                            match_filter["agent_id"] = agent_id
-                        if run_id:
-                            match_filter["run_id"] = run_id
-                        
-                        pipeline.append({"$match": match_filter})
-                    
-                    for doc in self.collection.aggregate(pipeline):
-                        results.append({
-                            "id": str(doc["_id"]),
-                            "memory": doc["content"],
-                            "metadata": doc.get("metadata", {}),
-                            "score": doc.get("score", 1.0)
-                        })
-            
-            # Fallback to text search
-            if not results:
-                search_filter = {"$text": {"$search": query}}
-                
-                # Add additional filters
-                if user_id:
-                    search_filter["user_id"] = user_id
-                if agent_id:
-                    search_filter["agent_id"] = agent_id
-                if run_id:
-                    search_filter["run_id"] = run_id
-                
-                for doc in self.collection.find(search_filter).limit(kwargs.get("limit", 10)):
-                    results.append({
-                        "id": str(doc["_id"]),
-                        "memory": doc["content"],
-                        "metadata": doc.get("metadata", {}),
-                        "score": 1.0
-                    })
-            
-            return results
-            
-        except Exception as e:
-            logging.error(f"Error searching MongoDB: {e}")
-            return []
-    
-    def get_all(self, user_id=None, agent_id=None, run_id=None):
-        """Get all memories from MongoDB."""
-        try:
-            search_filter = {}
-            if user_id:
-                search_filter["user_id"] = user_id
-            if agent_id:
-                search_filter["agent_id"] = agent_id
-            if run_id:
-                search_filter["run_id"] = run_id
-            
-            results = []
-            for doc in self.collection.find(search_filter):
-                results.append({
-                    "id": str(doc["_id"]),
-                    "memory": doc["content"],
-                    "metadata": doc.get("metadata", {}),
-                    "created_at": doc.get("created_at")
-                })
-            
-            return results
-            
-        except Exception as e:
-            logging.error(f"Error getting all memories from MongoDB: {e}")
-            return []
-    
-    def get(self, memory_id):
-        """Get a specific memory by ID."""
-        try:
-            from bson import ObjectId
-            doc = self.collection.find_one({"_id": ObjectId(memory_id)})
-            if doc:
-                return {
-                    "id": str(doc["_id"]),
-                    "memory": doc["content"],
-                    "metadata": doc.get("metadata", {}),
-                    "created_at": doc.get("created_at")
-                }
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error getting memory from MongoDB: {e}")
-            return None
-    
-    def update(self, memory_id, data):
-        """Update a memory."""
-        try:
-            from bson import ObjectId
-            result = self.collection.update_one(
-                {"_id": ObjectId(memory_id)},
-                {"$set": {"content": data, "updated_at": datetime.utcnow()}}
-            )
-            return result.modified_count > 0
-            
-        except Exception as e:
-            logging.error(f"Error updating memory in MongoDB: {e}")
-            return False
-    
-    def delete(self, memory_id):
-        """Delete a memory."""
-        try:
-            from bson import ObjectId
-            result = self.collection.delete_one({"_id": ObjectId(memory_id)})
-            return result.deleted_count > 0
-            
-        except Exception as e:
-            logging.error(f"Error deleting memory from MongoDB: {e}")
-            return False
-    
-    def delete_all(self, user_id=None, agent_id=None, run_id=None):
-        """Delete all memories."""
-        try:
-            search_filter = {}
-            if user_id:
-                search_filter["user_id"] = user_id
-            if agent_id:
-                search_filter["agent_id"] = agent_id
-            if run_id:
-                search_filter["run_id"] = run_id
-            
-            result = self.collection.delete_many(search_filter)
-            return result.deleted_count
-            
-        except Exception as e:
-            logging.error(f"Error deleting all memories from MongoDB: {e}")
-            return 0
-    
-    def reset(self):
-        """Reset all memories."""
-        try:
-            result = self.collection.delete_many({})
-            return result.deleted_count
-            
-        except Exception as e:
-            logging.error(f"Error resetting MongoDB memories: {e}")
-            return 0
+# MongoDBMemory has been moved to adapters/mongodb_adapter.py
+# This maintains backward compatibility while following protocol-driven architecture
 
 class Knowledge:
     def __init__(self, config=None, verbose=None):
@@ -390,18 +66,22 @@ class Knowledge:
                 '_client',
                 'main'
             ]:
-                logging.getLogger(logger_name).setLevel(logging.WARNING)
+                get_logger(logger_name).setLevel(logging.WARNING)
             
             # Disable OpenAI API request logging
-            logging.getLogger('openai').setLevel(logging.WARNING)
+            get_logger('openai').setLevel(logging.WARNING)
+            
+        # Initialize provider using protocol-driven approach
+        self._provider = None
 
-    @cached_property
+    @cached_property 
     def _deps(self):
+        """Lazy load dependencies only when needed (backward compatibility)."""
+        # This is kept for backward compatibility with existing code
+        # The new protocol-driven approach uses adapters via registry
         try:
             from markitdown import MarkItDown
-            import chromadb
             return {
-                'chromadb': chromadb,
                 'markdown': MarkItDown()
             }
         except ImportError:
@@ -418,14 +98,13 @@ class Knowledge:
         from ..paths import get_project_data_dir
         persist_dir = str(get_project_data_dir())
 
-        # Create persistent client config
+        # Create persistent client config (protocol-driven)
         base_config = {
             "vector_store": {
                 "provider": "chroma",
                 "config": {
                     "collection_name": default_collection,
                     "path": persist_dir,
-                    "client": self._deps['chromadb'].PersistentClient(path=persist_dir),
                     "host": None,
                     "port": None
                 }
@@ -514,15 +193,51 @@ class Knowledge:
 
     @cached_property
     def memory(self):
-        # Check if MongoDB provider is specified
-        if (self.config.get("vector_store", {}).get("provider") == "mongodb"):
-            try:
-                return MongoDBMemory(self.config)
-            except Exception as e:
-                logger.error(f"Failed to initialize MongoDB memory: {e}")
-                # Fall back to default memory
-                pass
+        """Initialize knowledge adapter using protocol-driven approach."""
+        # Import registry functions
+        from .adapters import get_knowledge_adapter, get_first_available_knowledge_adapter
         
+        # Determine provider preference
+        provider = self.config.get("vector_store", {}).get("provider", "mem0")
+        self._log(f"Requested knowledge provider: {provider}")
+        
+        # Map legacy provider names to adapter names
+        provider_mapping = {
+            "chroma": "chroma",
+            "mongodb": "mongodb", 
+            "mem0": "mem0",
+            "sqlite": "sqlite"
+        }
+        
+        adapter_name = provider_mapping.get(provider, "mem0")
+        
+        # Try to get preferred adapter, fallback to available ones
+        try:
+            adapter = get_knowledge_adapter(adapter_name, config=self.config, verbose=self._verbose)
+        except Exception as e:
+            self._log(f"Failed to initialize '{adapter_name}': {e}")
+            adapter = None
+        
+        if adapter is None:
+            # Fallback to first available adapter
+            self._log(f"Provider '{adapter_name}' not available, trying fallbacks")
+            fallback_result = get_first_available_knowledge_adapter(
+                preferences=["sqlite", "mem0"],
+                config=self.config,
+                verbose=self._verbose
+            )
+            if fallback_result:
+                adapter_name, adapter = fallback_result
+                self._log(f"Using fallback knowledge adapter: {adapter_name}")
+            else:
+                # Final fallback: try legacy mem0 approach for backward compatibility
+                return self._init_legacy_memory()
+        
+        self._log(f"Initialized knowledge adapter: {adapter_name}")
+        return adapter
+        
+    def _init_legacy_memory(self):
+        """Legacy fallback memory initialization for backward compatibility."""
         # Prepare config for mem0 (strip PraisonAI-specific fields)
         mem0_config = self._prepare_mem0_config(self.config)
         
@@ -647,7 +362,20 @@ class Knowledge:
         if rerank is None:
             rerank = self.config.get("reranker", {}).get("default_rerank", False)
         
-        results = self.memory.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id, rerank=rerank, **kwargs)
+        try:
+            results = self.memory.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id, rerank=rerank, **kwargs)
+        except TypeError as e:
+            # Additional safeguard for mem0 MongoDB vector store issues
+            error_msg = str(e).lower()
+            if "unexpected keyword argument" in error_msg and "vectors" in error_msg:
+                logger.warning(
+                    "Knowledge search failed due to mem0 MongoDB vector store compatibility issue. "
+                    "This is a known upstream bug: https://github.com/mem0ai/mem0/issues/3185. "
+                    "Returning empty results."
+                )
+                results = []
+            else:
+                raise
         
         # Emit trace event for knowledge search
         self._emit_knowledge_event("search", query, results, agent_id)
@@ -786,6 +514,7 @@ class Knowledge:
                 memories = [self.normalize_content(input_path)]
 
             # Create progress display
+            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
             progress = Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -809,10 +538,16 @@ class Knowledge:
                             elif isinstance(memory_result, list):
                                 all_results.extend(memory_result)
                             else:
-                                # Log warning for unexpected types but don't break
-                                import logging
-                                logging.warning(f"Unexpected memory_result type: {type(memory_result)}, skipping")
-                        progress.advance(store_task)
+                                from .models import AddResult
+                                if isinstance(memory_result, AddResult):
+                                    all_results.append(memory_result.id)
+                                elif hasattr(memory_result, 'results'):
+                                    all_results.extend(memory_result.results)
+                                else:
+                                    # Log warning for unexpected types but don't break
+                                    import logging
+                                    logging.warning(f"Unexpected memory_result type: {type(memory_result)}, skipping")
+                            progress.advance(store_task)
 
             # Emit trace event for knowledge add
             self._emit_knowledge_event("add", source=input_path, chunk_count=len(memories), 

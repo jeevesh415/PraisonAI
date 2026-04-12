@@ -21,6 +21,7 @@ docs.sh
 other
 output
 !src/praisonai/praisonai/cli/output/
+!src/praisonai-agents/praisonaiagents/output/
 
 .files
 threads.db
@@ -93,6 +94,7 @@ Cargo.lock
 **/*.rs.bk
 *.pdb
 .windsurf
-.agent
 
-src/praisonai/build
+src/praisonai/build*.egg-info/
+src/praisonai/PraisonAI.egg-info/
+jobs/*
