@@ -169,11 +169,70 @@ from ..config.feature_configs import (
 # Applied even when context management is disabled to prevent runaway tool outputs
 DEFAULT_TOOL_OUTPUT_LIMIT = 16000
 
-# Global variables for API server (protected by _server_lock for thread safety)
-_server_lock = threading.Lock()
-_server_started = {}  # Dict of port -> started boolean
-_registered_agents = {}  # Dict of port -> Dict of path -> agent_id
-_shared_apps = {}  # Dict of port -> FastAPI app
+class ServerRegistry:
+    """Registry for API server state per-port."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._server_started = {}  # Dict of port -> started boolean
+        self._registered_agents = {}  # Dict of port -> Dict of path -> agent_id  
+        self._shared_apps = {}  # Dict of port -> FastAPI app
+    
+    @staticmethod
+    def get_default_instance():
+        """Get default global registry for backward compatibility."""
+        if not hasattr(ServerRegistry, '_default_instance'):
+            import threading
+            # Double-checked locking pattern for thread safety
+            with threading.Lock():
+                if not hasattr(ServerRegistry, '_default_instance'):
+                    ServerRegistry._default_instance = ServerRegistry()
+        return ServerRegistry._default_instance
+    
+    def is_server_started(self, port: int) -> bool:
+        with self._lock:
+            return self._server_started.get(port, False)
+    
+    def set_server_started(self, port: int, started: bool) -> None:
+        with self._lock:
+            self._server_started[port] = started
+    
+    def get_shared_app(self, port: int):
+        with self._lock:
+            return self._shared_apps.get(port)
+    
+    def set_shared_app(self, port: int, app) -> None:
+        with self._lock:
+            self._shared_apps[port] = app
+    
+    def register_agent(self, port: int, path: str, agent_id: str) -> None:
+        with self._lock:
+            if port not in self._registered_agents:
+                self._registered_agents[port] = {}
+            self._registered_agents[port][path] = agent_id
+    
+    def get_registered_agents(self, port: int) -> dict:
+        with self._lock:
+            return self._registered_agents.get(port, {}).copy()
+
+    def cleanup_agent_registrations(self, agent_id: str) -> None:
+        """Remove all registrations for an agent ID and clean empty port state."""
+        with self._lock:
+            ports_to_clean = []
+            for port, path_dict in self._registered_agents.items():
+                paths_to_remove = [path for path, registered_id in path_dict.items() if registered_id == agent_id]
+                for path in paths_to_remove:
+                    del path_dict[path]
+                if not path_dict:
+                    ports_to_clean.append(port)
+
+            for port in ports_to_clean:
+                self._registered_agents.pop(port, None)
+                self._server_started.pop(port, None)
+
+# Backward compatibility - use default instance
+def _get_default_server_registry() -> ServerRegistry:
+    return ServerRegistry.get_default_instance()
 
 # Don't import FastAPI dependencies here - use lazy loading instead
 
@@ -1042,18 +1101,18 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 if _memory_config.auto_save is not None:
                     auto_save = _memory_config.auto_save
                 # Convert to internal format
-                backend = _memory_config.backend
-                if hasattr(backend, 'value'):
-                    backend = backend.value
+                memory_backend = _memory_config.backend
+                if hasattr(memory_backend, 'value'):
+                    memory_backend = memory_backend.value
                 # If learn is enabled, pass as dict to trigger full Memory class
                 if _memory_config.learn:
                     memory = _memory_config.to_dict()
-                elif backend == "file":
+                elif memory_backend == "file":
                     memory = True
                 elif _memory_config.config:
                     memory = _memory_config.config
                 else:
-                    memory = backend
+                    memory = memory_backend
             elif hasattr(_memory_config, 'search') and hasattr(_memory_config, 'add'):
                 # Memory instance - pass through
                 pass
@@ -1563,6 +1622,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
         # Token budget guard (zero overhead when _max_budget is None)
         self._max_budget = _max_budget
         self._on_budget_exceeded = _on_budget_exceeded
+        # Thread-safe cost/token tracking (Gap 1a fix)
+        self._cost_lock = threading.Lock()
         self._total_cost = 0.0
         self._total_tokens_in = 0
         self._total_tokens_out = 0
@@ -1906,7 +1967,9 @@ Your Goal: {self.goal}
     @property
     def total_cost(self) -> float:
         """Cumulative USD cost of all LLM calls in this agent run."""
-        return self._total_cost
+        # Thread-safe cost reading (Gap 1a fix)
+        with self._cost_lock:
+            return self._total_cost
 
     @property
     def cost_summary(self) -> dict:
@@ -1915,12 +1978,14 @@ Your Goal: {self.goal}
         Returns:
             dict with keys: tokens_in, tokens_out, cost, llm_calls
         """
-        return {
-            "tokens_in": self._total_tokens_in,
-            "tokens_out": self._total_tokens_out,
-            "cost": self._total_cost,
-            "llm_calls": self._llm_call_count,
-        }
+        # Thread-safe cost reading (Gap 1a fix)
+        with self._cost_lock:
+            return {
+                "tokens_in": self._total_tokens_in,
+                "tokens_out": self._total_tokens_out,
+                "cost": self._total_cost,
+                "llm_calls": self._llm_call_count,
+            }
 
     @property
     def context_manager(self) -> Optional[Any]:
@@ -4501,6 +4566,39 @@ Answer:"""
         except Exception as e:
             logger.warning(f"Memory cleanup failed: {e}")
 
+        # LLM client cleanup - target actual live clients, not model strings
+        try:
+            # Primary cleanup targets - actual live clients
+            if hasattr(self, 'llm_instance') and self.llm_instance:
+                if hasattr(self.llm_instance, 'aclose'):
+                    # Try async close first
+                    try:
+                        import asyncio
+                        if asyncio.iscoroutinefunction(self.llm_instance.aclose):
+                            # We're in sync context, so use asyncio.run() for the cleanup
+                            asyncio.run(self.llm_instance.aclose())
+                        else:
+                            self.llm_instance.aclose()
+                    except Exception:
+                        # Fall back to sync close if async fails
+                        if hasattr(self.llm_instance, 'close'):
+                            self.llm_instance.close()
+                elif hasattr(self.llm_instance, 'close'):
+                    self.llm_instance.close()
+            
+            # Check for OpenAI client (common pattern in agents)
+            if hasattr(self, '_Agent__openai_client') and self._Agent__openai_client:
+                if hasattr(self._Agent__openai_client, 'close'):
+                    self._Agent__openai_client.close()
+            
+            # Legacy fallback - check self.llm._client (but less likely to work)
+            if hasattr(self, 'llm') and self.llm and not isinstance(self.llm, str):
+                llm_client = getattr(self.llm, '_client', None)
+                if llm_client and hasattr(llm_client, 'close'):
+                    llm_client.close()
+        except Exception as e:
+            logger.warning(f"LLM client cleanup failed: {e}")
+
         # MCP cleanup  
         try:
             if hasattr(self, '_mcp_clients') and self._mcp_clients:
@@ -4571,28 +4669,7 @@ Answer:"""
             return  # No ID generated, nothing registered
             
         try:
-            agent_id = self._agent_id
-            with _server_lock:
-                # Remove from _registered_agents
-                ports_to_clean = []
-                for port, path_dict in _registered_agents.items():
-                    paths_to_remove = []
-                    for path, registered_id in path_dict.items():
-                        if registered_id == agent_id:
-                            paths_to_remove.append(path)
-                    
-                    for path in paths_to_remove:
-                        del path_dict[path]
-                    
-                    # If no paths left for this port, mark port for cleanup
-                    if not path_dict:
-                        ports_to_clean.append(port)
-                
-                # Clean up empty port entries
-                for port in ports_to_clean:
-                    _registered_agents.pop(port, None)
-                    _server_started.pop(port, None)
-                    # Note: We don't clean up _shared_apps here as other agents might be using them
+            _get_default_server_registry().cleanup_agent_registrations(self._agent_id)
                     
         except Exception as e:
             import sys
@@ -4629,4 +4706,3 @@ Answer:"""
 
     def __str__(self):
         return f"Agent(name='{self.name}', role='{self.role}', goal='{self.goal}')"
-
