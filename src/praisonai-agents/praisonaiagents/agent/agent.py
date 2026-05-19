@@ -20,6 +20,8 @@ from .tool_execution import ToolExecutionMixin
 from .chat_handler import ChatHandlerMixin
 from .session_manager import SessionManagerMixin
 from .async_safety import AsyncSafeState
+from .unified_execution_mixin import UnifiedExecutionMixin
+from .sandbox_mixin import SandboxMixin
 
 # Module-level logger for thread safety errors and debugging
 logger = get_logger(__name__)
@@ -178,13 +180,15 @@ class ServerRegistry:
         self._registered_agents = {}  # Dict of port -> Dict of path -> agent_id  
         self._shared_apps = {}  # Dict of port -> FastAPI app
     
+    # Class-level lock for thread-safe singleton creation
+    _instance_lock = threading.Lock()
+    
     @staticmethod
     def get_default_instance():
         """Get default global registry for backward compatibility."""
         if not hasattr(ServerRegistry, '_default_instance'):
-            import threading
-            # Double-checked locking pattern for thread safety
-            with threading.Lock():
+            # Double-checked locking pattern with shared class-level lock
+            with ServerRegistry._instance_lock:
                 if not hasattr(ServerRegistry, '_default_instance'):
                     ServerRegistry._default_instance = ServerRegistry()
         return ServerRegistry._default_instance
@@ -242,6 +246,7 @@ if TYPE_CHECKING:
     from ..context.models import ContextConfig
     from ..context.manager import ContextManager
     from ..knowledge.knowledge import Knowledge
+    from .interrupt import InterruptController
     from ..agent.autonomy import AutonomyConfig
     from ..task.task import Task
     from .handoff import Handoff, HandoffConfig, HandoffResult
@@ -251,7 +256,7 @@ if TYPE_CHECKING:
 # Import structured error from central errors module
 from ..errors import BudgetExceededError
 
-class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
+class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
     _agent_counter_lock = threading.Lock()
@@ -515,6 +520,7 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
         model: Optional[Union[str, Any]] = None,  # Alias for llm=
         base_url: Optional[str] = None,  # Kept separate (connection/auth)
         api_key: Optional[str] = None,  # Kept separate (connection/auth)
+        auth: Optional[str] = None,  # Subscription auth provider: "claude-code", "codex", etc.
         # Tools
         tools: Optional[List[Any]] = None,
         allow_delegation: bool = False,  # Deprecated: use handoffs= instead
@@ -528,7 +534,7 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
         # CONSOLIDATED FEATURE PARAMS (agent-centric API)
         # Each follows: False=disabled, True=defaults, Config=custom
         # ============================================================
-        memory: Optional[Union[bool, str, 'MemoryConfig', 'MemoryManager']] = None,
+        memory: Optional[Union[bool, str, 'MemoryConfig', Any]] = None,
         knowledge: Optional[Union[bool, str, List[str], 'KnowledgeConfig', 'Knowledge']] = None,
         planning: Optional[Union[bool, str, 'PlanningConfig']] = False,
         reflection: Optional[Union[bool, str, 'ReflectionConfig']] = None,
@@ -545,8 +551,12 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
         skills: Optional[Union[List[str], str, Dict[str, Any], 'SkillsConfig']] = None,
         approval: Optional[Union[bool, str, Dict[str, Any], 'ApprovalConfig', 'ApprovalProtocol']] = None,
         tool_timeout: Optional[int] = None,  # P8/G11: Timeout in seconds for each tool call
+        parallel_tool_calls: bool = False,  # Gap 2: Enable parallel execution of batched LLM tool calls
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
         backend: Optional[Any] = None,  # External managed agent backend (e.g., ManagedAgentIntegration)
+        cli_backend: Optional[Union[str, Any]] = None,  # CLI backend for delegating turns (e.g., "claude-code")
+        interrupt_controller: Optional['InterruptController'] = None,  # G2: Cooperative cancellation
+        sandbox: Optional[Union[bool, 'SandboxConfig']] = None,  # Sandbox for safe code execution
     ):
         """Initialize an Agent instance.
 
@@ -571,7 +581,7 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
             memory: Memory system configuration. Accepts:
                 - bool: True enables defaults, False disables
                 - MemoryConfig: Custom configuration
-                - MemoryManager: Pre-configured instance
+                - Any: Pre-configured memory instance
             knowledge: Knowledge sources. Accepts:
                 - bool: True enables defaults
                 - List[str]: File paths, URLs, or text content
@@ -634,11 +644,22 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 - LearnConfig: Custom configuration
                 Learning is a first-class citizen, peer to memory. It captures patterns,
                 preferences, and insights from interactions to improve future responses.
+            parallel_tool_calls: Enable parallel execution of batched LLM tool calls (default False).
+                When True and LLM returns multiple tool calls in a single response, they execute
+                concurrently instead of sequentially. Provides ~3x speedup for I/O-bound tools.
+                Maintains backward compatibility with False default.
             backend: External managed agent backend for hybrid execution. Accepts:
                 - ManagedAgentIntegration: External managed agent service
                 - None: Use local execution (default)
                 When provided, agent can delegate execution to managed infrastructure
                 for long-running tasks or when local resources are constrained.
+            cli_backend: CLI backend for delegating full turns to external CLI tools. Accepts:
+                - str: Backend ID ("claude-code", "codex-cli", "gemini-cli")
+                - CliBackendProtocol: Custom CLI backend instance
+                - None: Use standard LLM execution (default)
+                When provided, agent delegates entire conversation turns to the CLI tool
+                instead of using the built-in LLM. Enables session continuity and 
+                tool integration through external AI coding assistants.
 
         Raises:
             ValueError: If all of name, role, goal, backstory, and instructions are None.
@@ -768,6 +789,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 alternative="use 'execution=ExecutionConfig(rate_limiter=obj)' instead",
                 stacklevel=3
             )
+        # Note: parallel_tool_calls is NOT deprecated - it's a new Gap 2 feature
+        # Both direct parameter and ExecutionConfig.parallel_tool_calls are supported
         if verification_hooks is not None:
             warn_deprecated_param(
                 "verification_hooks",
@@ -943,6 +966,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 allow_code_execution = True
             if _exec_config.code_mode != "safe":
                 code_execution_mode = _exec_config.code_mode
+            # Get parallel_tool_calls from ExecutionConfig, fall back to parameter
+            parallel_tool_calls = getattr(_exec_config, 'parallel_tool_calls', parallel_tool_calls)
             # Budget guard extraction
             _max_budget = getattr(_exec_config, 'max_budget', None)
             _on_budget_exceeded = getattr(_exec_config, 'on_budget_exceeded', 'stop') or 'stop'
@@ -950,6 +975,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
             max_iter, max_rpm, max_execution_time, max_retry_limit = 20, None, None, 2
             _max_budget = None
             _on_budget_exceeded = 'stop'
+            # Keep parallel_tool_calls parameter value when no ExecutionConfig provided
+            # (already set from parameter, no need to override)
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve TEMPLATES param - FAST PATH
@@ -1040,7 +1067,7 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
         if skills is None:
             _skills_config = None
         elif isinstance(skills, list):
-            _skills_config = SkillsConfig(sources=skills)
+            _skills_config = SkillsConfig(paths=skills)
         elif isinstance(skills, SkillsConfig):
             _skills_config = skills
         else:
@@ -1052,10 +1079,12 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 string_mode="path_as_source",
                 default=None,
             )
+        _skills_auto_discover = False
         if _skills_config is not None:
             if isinstance(_skills_config, SkillsConfig):
                 _skills = _skills_config.paths
                 skills_dirs = _skills_config.dirs
+                _skills_auto_discover = bool(_skills_config.auto_discover)
             elif isinstance(_skills_config, list):
                 _skills = _skills_config
         
@@ -1440,6 +1469,10 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
             self.self_reflect = True if self_reflect is None else self_reflect
         
         self.instructions = instructions
+        # Gap 2: Store parallel tool calls setting for ToolCallExecutor selection
+        self.parallel_tool_calls = parallel_tool_calls
+        # G2: Store interrupt controller for cooperative cancellation
+        self.interrupt_controller = interrupt_controller
         # Check for model name in environment variable if not provided
         self._using_custom_llm = False
         # Flag to track if final result has been displayed to prevent duplicates
@@ -1491,6 +1524,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                     llm_config['base_url'] = base_url
                     if api_key:
                         llm_config['api_key'] = api_key
+                    if auth:
+                        llm_config['auth'] = auth
                     llm_config['metrics'] = metrics
                     self.llm_instance = LLM(**llm_config)
                     self.llm = llm.get('model', Agent._get_default_model())
@@ -1501,6 +1536,7 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                         model=model_name,
                         base_url=base_url,
                         api_key=api_key,
+                        auth=auth,
                         metrics=metrics,
                         web_search=web_search,
                         web_fetch=web_fetch,
@@ -1522,6 +1558,10 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 if api_key and 'api_key' not in llm:
                     llm = llm.copy()
                     llm['api_key'] = api_key
+                # Add auth if provided and not in dict
+                if auth and 'auth' not in llm:
+                    llm = llm.copy()
+                    llm['auth'] = auth
                 # Add metrics parameter
                 llm = llm.copy()
                 llm['metrics'] = metrics
@@ -1541,6 +1581,8 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 llm_params = {'model': llm}
                 if api_key:
                     llm_params['api_key'] = api_key
+                if auth:
+                    llm_params['auth'] = auth
                 llm_params['metrics'] = metrics
                 llm_params['web_search'] = web_search
                 llm_params['web_fetch'] = web_fetch
@@ -1675,6 +1717,9 @@ Your Goal: {self.goal}
         self.prompt_caching = prompt_caching
         self.claude_memory = claude_memory
         
+        # Initialize closure flag for GC cleanup
+        self._closed = False
+        
         # Session management
         self.auto_save = auto_save  # Session name for auto-saving
         
@@ -1738,6 +1783,31 @@ Your Goal: {self.goal}
             self._approval_backend = None
             self._approve_all_tools = False
             self._approval_timeout = 0
+            # No explicit approval kwarg — honour PRAISONAI_TOOL_SAFETY.
+            # Default preset "default" blocks only destructive ops
+            # (delete_*, execute_command, execute_code, kill_process, move/copy)
+            # while leaving read / create / edit tools fully auto-approved.
+            # Users who want the pre-4.6.27 "trust everything" behaviour
+            # export PRAISONAI_TOOL_SAFETY=off. This adds zero Agent kwargs.
+            _raw_safety_env = os.environ.get("PRAISONAI_TOOL_SAFETY")
+            _safety_env = (_raw_safety_env or "").strip().lower()
+            if _safety_env not in ("off", "full", "none", "0", "false"):
+                from ..approval.registry import PERMISSION_PRESETS
+                _resolved_safety_env = _safety_env or "default"
+                _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+                if _preset_deny is None and _safety_env:
+                    # Unknown env value - fall back to safe default and log warning
+                    # (logging is already imported at module level; a local `import logging`
+                    # here would shadow it and cause UnboundLocalError on earlier uses
+                    # inside __init__ such as the custom-LLM tools branch.)
+                    logging.getLogger(__name__).warning(
+                        "Unknown PRAISONAI_TOOL_SAFETY value %r; falling back to 'default' preset.",
+                        _raw_safety_env,
+                    )
+                    _resolved_safety_env = "default"
+                    _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+                if _preset_deny is not None:
+                    self._perm_deny = _preset_deny
         elif isinstance(approval, ApprovalConfig):
             self._approval_backend = approval.backend
             self._approve_all_tools = approval.all_tools
@@ -1763,6 +1833,7 @@ Your Goal: {self.goal}
             self._approval_backend = AutoApproveBackend()
         # Pending approvals for async (non-blocking) mode
         self._pending_approvals = {}
+        self._approvals_lock = asyncio.Lock()
         
         # P8/G11: Tool timeout - prevent slow tools from blocking
         self._tool_timeout = tool_timeout
@@ -1817,6 +1888,7 @@ Your Goal: {self.goal}
         # Agent Skills configuration (lazy loaded for zero performance impact)
         self._skills = _skills
         self._skills_dirs = skills_dirs
+        self._skills_auto_discover = _skills_auto_discover
         self._skill_manager = None  # Lazy loaded
         self._skills_initialized = False
 
@@ -1867,10 +1939,18 @@ Your Goal: {self.goal}
 
         # Backend - external managed agent backend for hybrid execution
         self.backend = backend
+        
+        # CLI Backend - external CLI backend for delegating full turns
+        self._cli_backend = None
+        if cli_backend is not None:
+            self._cli_backend = self._resolve_cli_backend(cli_backend)
 
         # Telemetry - lazy initialized via property for performance
         self.__telemetry = None
         self.__telemetry_initialized = False
+        
+        # Sandbox configuration - initialize SandboxMixin
+        super().__init__(sandbox=sandbox)
 
     @property
     def _telemetry(self):
@@ -1891,13 +1971,29 @@ Your Goal: {self.goal}
     
     @chat_history.setter
     def chat_history(self, value):
-        """Set chat history (updates the underlying async-safe state)."""
-        self.__chat_history_state.value = value
+        """Set chat history (updates the underlying async-safe state with lock)."""
+        with self.__chat_history_state.lock():
+            self.__chat_history_state.value = value
     
     @property
     def _history_lock(self):
         """Get appropriate lock for chat history based on execution context."""
         return self.__chat_history_state
+    
+    def _append_to_chat_history(self, message: dict):
+        """Thread-safe append to chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value.append(message)
+    
+    def _truncate_chat_history(self, length: int):
+        """Thread-safe truncation of chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value[:] = self._history_lock.value[:length]
+    
+    def _replace_chat_history(self, new_history: List[Dict[str, Any]]):
+        """Thread-safe replacement of entire chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value[:] = new_history
 
     @property
     def _cache_lock(self):
@@ -2203,31 +2299,52 @@ Summary:"""
     @property
     def skill_manager(self) -> Optional[Any]:
         """Lazily initialize SkillManager only when skills are accessed."""
-        if self._skill_manager is None and (self._skills or self._skills_dirs):
+        auto_discover = bool(getattr(self, "_skills_auto_discover", False))
+        should_init = self._skill_manager is None and (
+            self._skills or self._skills_dirs or auto_discover
+        )
+        if should_init:
             from ..skills import SkillManager
             self._skill_manager = SkillManager()
-            
+
             # Add explicit skill paths
             if self._skills:
                 for skill_path in self._skills:
                     self._skill_manager.add_skill(skill_path)
-            
-            # Discover skills from directories
+
+            # Discover skills from directories; honour SkillsConfig.auto_discover
+            # by falling back to default locations when requested.
             if self._skills_dirs:
-                self._skill_manager.discover(self._skills_dirs, include_defaults=False)
-            
+                self._skill_manager.discover(
+                    self._skills_dirs,
+                    include_defaults=auto_discover,
+                )
+            elif auto_discover:
+                self._skill_manager.discover(include_defaults=True)
+
             self._skills_initialized = True
-            
+
             # Auto-add skill execution tools if not already present
             self._add_skill_tools()
         return self._skill_manager
     
     def _add_skill_tools(self):
         """Add tools required for skill execution (read_file, run_skill_script).
-        
+
         Uses lazy imports from praisonaiagents.tools to avoid performance impact
         when skills are not used.
+
+        G-E fix: run_skill_script is now safer by default:
+        - PRAISONAI_DISABLE_SKILL_TOOLS=1: disables all skill tools (explicit deny wins)
+        - PRAISONAI_ENABLE_SKILL_TOOLS=1: enables run_skill_script by default
+        - Any loaded skill with 'run_skill_script' in allowed-tools: enables it
+        - Otherwise: only read_file is added (safer default)
         """
+        import os as _os
+        if _os.environ.get("PRAISONAI_DISABLE_SKILL_TOOLS") in ("1", "true", "True"):
+            logging.info("Skill helper tools disabled via PRAISONAI_DISABLE_SKILL_TOOLS")
+            return
+
         # Check if tools already include required capabilities
         tool_names = set()
         for tool in self.tools:
@@ -2236,7 +2353,7 @@ Summary:"""
             elif hasattr(tool, 'name'):
                 tool_names.add(tool.name)
         
-        # Add read_file if not present
+        # Add read_file if not present (low risk, always enabled)
         if 'read_file' not in tool_names:
             try:
                 from ..tools import read_file
@@ -2245,8 +2362,26 @@ Summary:"""
             except ImportError:
                 logging.warning("Could not import read_file tool for skills")
         
-        # Add run_skill_script from skill_tools module
-        if 'run_skill_script' not in tool_names:
+        # G-E fix: run_skill_script safer by default
+        # Only add if explicitly enabled OR any skill declares it in allowed-tools
+        should_add_script_tool = False
+        
+        # Check explicit environment enable
+        if _os.environ.get("PRAISONAI_ENABLE_SKILL_TOOLS") in ("1", "true", "True"):
+            should_add_script_tool = True
+            logging.debug("run_skill_script enabled via PRAISONAI_ENABLE_SKILL_TOOLS")
+        
+        # Check if any loaded skill declares it in allowed-tools
+        if self._skill_manager and not should_add_script_tool:
+            for skill in self._skill_manager.skills:
+                allowed_tools = self._skill_manager.get_allowed_tools(skill.properties.name)
+                if "run_skill_script" in allowed_tools:
+                    should_add_script_tool = True
+                    logging.debug(f"run_skill_script enabled by skill '{skill.properties.name}' allowed-tools")
+                    break
+        
+        # Add run_skill_script if conditions are met
+        if should_add_script_tool and 'run_skill_script' not in tool_names:
             try:
                 from ..tools.skill_tools import create_skill_tools
                 # Create skill tools with current working directory
@@ -2777,6 +2912,19 @@ Summary:"""
                         started_at=started_at,
                     )
                 
+                # G2: Check for interrupt request (cooperative cancellation) - sync version
+                if self.interrupt_controller and self.interrupt_controller.is_set():
+                    reason = self.interrupt_controller.reason or "unknown"
+                    return AutonomyResult(
+                        success=False,
+                        output=f"Task interrupted: {reason}",
+                        completion_reason="interrupted",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
                 
                 # Execute one turn using the agent's chat method
                 # Always use the original prompt (prompt re-injection)
@@ -3167,6 +3315,20 @@ Summary:"""
                         success=False,
                         output="Task timed out",
                         completion_reason="timeout",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # G2: Check for interrupt request (cooperative cancellation)
+                if self.interrupt_controller and self.interrupt_controller.is_set():
+                    reason = self.interrupt_controller.reason or "unknown"
+                    return AutonomyResult(
+                        success=False,
+                        output=f"Task interrupted: {reason}",
+                        completion_reason="interrupted",
                         iterations=iterations,
                         stage=stage,
                         actions=actions_taken,
@@ -4546,9 +4708,141 @@ Answer:"""
     # -------------------------------------------------------------------------
     
     
-    @contextlib.contextmanager
+    # -------------------------------------------------------------------------
+    #                       CLI Backend Management
+    # -------------------------------------------------------------------------
     
-
+    def _resolve_cli_backend(self, cli_backend):
+        """Validate and return CLI backend protocol instance.
+        
+        Args:
+            cli_backend: CliBackendProtocol instance or callable that returns one
+            
+        Returns:
+            CliBackendProtocol instance
+            
+        Note:
+            String backend IDs must be resolved to instances in the wrapper layer
+            before passing to Agent. This maintains proper dependency direction
+            per AGENTS.md (core SDK should not import from wrapper).
+        """
+        # Import protocols
+        try:
+            from ..cli_backend import CliBackendProtocol
+        except ImportError:
+            raise ImportError(
+                "CLI backend features requested but protocols not available. "
+                "This should not happen in a properly installed praisonaiagents package."
+            )
+        
+        # If already a protocol instance, return as-is
+        if hasattr(cli_backend, 'execute') and hasattr(cli_backend, 'stream'):
+            return cli_backend
+            
+        # If callable (factory function), call it to get instance
+        if callable(cli_backend):
+            instance = cli_backend()
+            if hasattr(instance, 'execute') and hasattr(instance, 'stream'):
+                return instance
+            raise TypeError(f"CLI backend factory returned invalid type: {type(instance)}. Expected CliBackendProtocol.")
+        
+        # String IDs are no longer supported at core level - must be resolved in wrapper
+        if isinstance(cli_backend, str):
+            raise TypeError(
+                f"String CLI backend IDs ('{cli_backend}') must be resolved to instances "
+                "in the wrapper layer. Use: praisonai.Agent(cli_backend='claude-code') "
+                "or manually resolve: agent = praisonaiagents.Agent(cli_backend=resolve_cli_backend('claude-code'))"
+            )
+        
+        raise TypeError(f"Invalid cli_backend type: {type(cli_backend)}. Expected CliBackendProtocol instance or factory callable.")
+    
+    async def _chat_via_cli_backend(self, prompt: str, **kwargs) -> Optional[str]:
+        """Chat implementation using CLI backend delegation.
+        
+        Args:
+            prompt: User prompt
+            **kwargs: Additional chat parameters (passed through as metadata)
+            
+        Returns:
+            CLI backend response content
+        """
+        if not self._cli_backend:
+            raise RuntimeError("CLI backend not configured")
+        
+        try:
+            # Import backend types
+            from ..cli_backend import CliSessionBinding
+            
+            # Build session binding for state management
+            session_id = getattr(self, '_session_id', None) or f"agent-{self.agent_id}"
+            session_binding = CliSessionBinding(session_id=session_id)
+            
+            # Get system prompt from agent configuration
+            system_prompt = None
+            if hasattr(self, 'system_prompt') and self.system_prompt:
+                system_prompt = self.system_prompt
+            elif self.backstory or self.role or self.goal:
+                # Build system prompt from agent identity
+                parts = []
+                if self.backstory:
+                    parts.append(self.backstory)
+                if self.role:
+                    parts.append(f"Your Role: {self.role}")
+                if self.goal:
+                    parts.append(f"Your Goal: {self.goal}")
+                system_prompt = "\n".join(parts)
+            
+            # Extract images from attachments (if any)
+            images = kwargs.get('attachments')
+            if images:
+                # Filter for image files
+                image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+                images = [
+                    img for img in images 
+                    if any(img.lower().endswith(ext) for ext in image_extensions)
+                ]
+                if not images:
+                    images = None
+            
+            # Execute CLI backend
+            result = await self._cli_backend.execute(
+                prompt=prompt,
+                session=session_binding,
+                images=images,
+                system_prompt=system_prompt
+            )
+            
+            # Check for CLI backend errors
+            if result is None:
+                raise RuntimeError(
+                    f"CLI backend returned no result for agent={self.display_name!r}, "
+                    f"session_id={session_id!r}"
+                )
+            if getattr(result, "error", None):
+                raise RuntimeError(
+                    f"CLI backend failed for agent={self.display_name!r}, "
+                    f"session_id={session_id!r}: {result.error}"
+                )
+            
+            # Update chat history with the exchange
+            if hasattr(self, '_append_to_chat_history'):
+                self._append_to_chat_history({
+                    "role": "user", 
+                    "content": prompt
+                })
+                if result.content:
+                    self._append_to_chat_history({
+                        "role": "assistant", 
+                        "content": result.content
+                    })
+            
+            return result.content if result else None
+            
+        except Exception as e:
+            raise RuntimeError(
+                f"CLI backend execution failed for agent={self.display_name!r}: {e}"
+            ) from e
+    
     # -------------------------------------------------------------------------
     #                       Resource Lifecycle Management
     # -------------------------------------------------------------------------
@@ -4573,10 +4867,10 @@ Answer:"""
                 if hasattr(self.llm_instance, 'aclose'):
                     # Try async close first
                     try:
-                        import asyncio
                         if asyncio.iscoroutinefunction(self.llm_instance.aclose):
-                            # We're in sync context, so use asyncio.run() for the cleanup
-                            asyncio.run(self.llm_instance.aclose())
+                            # Use async bridge to safely close from any context
+                            from ..utils.async_bridge import run_coroutine_from_any_context
+                            run_coroutine_from_any_context(self.llm_instance.aclose())
                         else:
                             self.llm_instance.aclose()
                     except Exception:
@@ -4623,6 +4917,19 @@ Answer:"""
         except Exception as e:
             logger.warning(f"Task cleanup failed: {e}")
 
+        # ThreadPoolExecutor cleanup
+        try:
+            if hasattr(self, '_tool_executor') and self._tool_executor:
+                # Use cancel_futures only if supported (Python 3.9+)
+                import sys
+                if sys.version_info >= (3, 9):
+                    self._tool_executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    self._tool_executor.shutdown(wait=False)
+                delattr(self, '_tool_executor')
+        except Exception as e:
+            logger.warning(f"ThreadPoolExecutor cleanup failed: {e}")
+
         # Always set closed flag
         self._closed = True
     
@@ -4657,6 +4964,23 @@ Answer:"""
                         await task
                     except asyncio.CancelledError:
                         pass
+
+            # ThreadPoolExecutor cleanup (async-safe)
+            if hasattr(self, '_tool_executor') and self._tool_executor:
+                import sys
+                loop = asyncio.get_running_loop()
+                # Use run_in_executor to avoid blocking the event loop
+                if sys.version_info >= (3, 9):
+                    await loop.run_in_executor(
+                        None, 
+                        lambda: self._tool_executor.shutdown(wait=False, cancel_futures=True)
+                    )
+                else:
+                    await loop.run_in_executor(
+                        None, 
+                        lambda: self._tool_executor.shutdown(wait=False)
+                    )
+                delattr(self, '_tool_executor')
             
             self._closed = True
             
@@ -4696,8 +5020,21 @@ Answer:"""
         await self.aclose()
     
     def __del__(self):
-        """Destructor safely does nothing to avoid GC pollution in test loops."""
-        pass
+        """Lightweight cleanup that only closes resources if not already closed."""
+        if not getattr(self, '_closed', False):
+            # Only close connections, skip anything that could fail during GC
+            try:
+                memory = getattr(self, "_memory_instance", None)
+                if memory and hasattr(memory, 'close_connections'):
+                    memory.close_connections()
+            except Exception as exc:  # noqa: BLE001 - finalizers must not raise
+                import contextlib
+                with contextlib.suppress(Exception):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug("Agent GC memory cleanup failed: %s", exc)
+            finally:
+                self._closed = True
         
     @property
     def is_closed(self) -> bool:

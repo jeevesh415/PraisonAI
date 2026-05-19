@@ -29,7 +29,15 @@ NO_PROMPT="${PRAISONAI_NO_PROMPT:-0}"
 DRY_RUN="${PRAISONAI_DRY_RUN:-0}"
 PYTHON_CMD="${PRAISONAI_PYTHON:-}"
 SKIP_VENV="${PRAISONAI_SKIP_VENV:-0}"
+NO_ONBOARD="${PRAISONAI_NO_ONBOARD:-0}"
 MIN_PYTHON_VERSION="3.10"
+
+# Set to 1 inside maybe_offer_bot_onboarding() when the bot wizard
+# succeeds. The wizard already prints a complete "✅ Done" panel with
+# the dashboard URL, bot-start command, gateway endpoints and doctor
+# hints — so we suppress the installer's own next-steps block to avoid
+# showing a second, partially duplicated summary after it.
+BOT_ONBOARDED=0
 
 # Logging functions - all output to stderr to avoid capturing in $()
 log_info() {
@@ -165,7 +173,16 @@ install_python_macos() {
         if [[ "$DRY_RUN" == "1" ]]; then
             log_info "[DRY RUN] Would install Homebrew"
         else
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            # Download and verify Homebrew installer
+            HOMEBREW_INSTALLER="/tmp/homebrew-install.sh"
+            curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$HOMEBREW_INSTALLER"
+            if [[ -f "$HOMEBREW_INSTALLER" ]]; then
+                /bin/bash "$HOMEBREW_INSTALLER"
+                rm -f "$HOMEBREW_INSTALLER"
+            else
+                log_error "Failed to download Homebrew installer"
+                exit 1
+            fi
             
             # Add Homebrew to PATH for this session
             if [[ -f "/opt/homebrew/bin/brew" ]]; then
@@ -502,6 +519,12 @@ print_next_steps() {
         echo ""
     fi
     
+    echo "  Set up a messaging bot (Telegram / Discord / Slack / WhatsApp):"
+    echo -e "     ${CYAN}praisonai onboard${NC}"
+    echo ""
+    echo "  Open the dashboard UI (localhost only):"
+    echo -e "     ${CYAN}praisonai claw${NC}    ${BOLD}→${NC} http://127.0.0.1:8082"
+    echo ""
     echo "  Quick start:"
     echo -e "     ${CYAN}python -c \"from praisonaiagents import Agent; Agent(name='test').start('Hello!')\"${NC}"
     echo ""
@@ -524,14 +547,16 @@ print_help() {
     echo "  --version VERSION    Install specific version (default: latest)"
     echo "  --extras EXTRAS      Install with extras (e.g., ui,chat,code)"
     echo "  --no-venv            Skip virtual environment creation"
+    echo "  --no-onboard         Skip interactive onboarding after install"
     echo "  --python PATH        Use specific Python executable"
     echo "  --dry-run            Print what would happen without making changes"
     echo "  --no-prompt          Skip interactive prompts"
     echo "  -h, --help           Show this help message"
     echo ""
     echo "Environment variables:"
-    echo "  PRAISONAI_VERSION    Specific version to install"
-    echo "  PRAISONAI_EXTRAS     Comma-separated extras"
+    echo "  PRAISONAI_VERSION     Specific version to install"
+    echo "  PRAISONAI_EXTRAS      Comma-separated extras"
+    echo "  PRAISONAI_NO_ONBOARD  Skip interactive onboarding (1 to enable)"
     echo "  PRAISONAI_NO_PROMPT  Skip interactive prompts (1 to enable)"
     echo "  PRAISONAI_DRY_RUN    Print what would happen (1 to enable)"
     echo "  PRAISONAI_PYTHON     Path to Python executable"
@@ -567,6 +592,10 @@ parse_args() {
                 SKIP_VENV="1"
                 shift
                 ;;
+            --no-onboard)
+                NO_ONBOARD="1"
+                shift
+                ;;
             --python)
                 PYTHON_CMD="$2"
                 shift 2
@@ -590,6 +619,115 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+# Run onboarding after successful installation
+run_onboarding() {
+    local venv_dir="$1"
+    
+    # Skip onboarding if requested
+    if [[ "$NO_ONBOARD" == "1" ]]; then
+        log_info "Skipping onboarding (--no-onboard)"
+        return 0
+    fi
+    
+    # Skip onboarding in non-interactive environments
+    if [[ "$NO_PROMPT" == "1" ]]; then
+        log_info "Skipping onboarding (non-interactive mode)"
+        return 0
+    fi
+    
+    # Check if TTY is available (required for interactive setup)
+    if ! [ -e /dev/tty ] || ! [ -t 1 ]; then
+        log_info "No TTY available — skipping onboarding. Run 'praisonai setup' later."
+        return 0
+    fi
+    
+    # Skip onboarding in dry run mode
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "Dry run mode — skipping onboarding"
+        return 0
+    fi
+    
+    log_step "Starting interactive setup wizard..."
+    
+    # Prefer venv python, then user-specified, then system python3
+    local py=""
+    if [[ -n "$venv_dir" && "$SKIP_VENV" != "1" && -x "$venv_dir/bin/python" ]]; then
+        py="$venv_dir/bin/python"
+    elif [[ -n "$PYTHON_CMD" ]] && command -v "$PYTHON_CMD" >/dev/null 2>&1; then
+        py="$PYTHON_CMD"
+    else
+        py="python3"
+    fi
+    
+    # Run the setup wizard
+    if "$py" -m praisonai setup < /dev/tty > /dev/tty 2> /dev/tty; then
+        log_success "Setup wizard completed successfully!"
+        echo ""
+        echo -e "${BOLD}${GREEN}You're all set! 🎉${NC}"
+        echo ""
+    else
+        log_warn "Setup wizard failed or was cancelled."
+        echo ""
+        echo -e "${YELLOW}Don't worry! You can run the setup wizard anytime with:${NC}"
+        echo -e "  ${CYAN}praisonai setup${NC}"
+        echo ""
+    fi
+}
+
+# Offer bot onboarding after setup (always prompts when a TTY is available;
+# default answer is Yes so curl|bash installs finish with a working bot).
+maybe_offer_bot_onboarding() {
+    local venv_dir="$1"
+
+    if [[ "$NO_ONBOARD" == "1" ]]; then
+        log_info "Skipping bot onboarding (--no-onboard)"
+        return 0
+    fi
+    if [[ "$NO_PROMPT" == "1" ]]; then
+        log_info "Skipping bot onboarding (non-interactive mode) — run 'praisonai onboard' later"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "Dry run — skipping bot onboarding"
+        return 0
+    fi
+    if ! [ -e /dev/tty ]; then
+        log_info "No TTY available — skipping bot onboarding. Run 'praisonai onboard' later."
+        return 0
+    fi
+
+    # Prefer venv python, then user-specified, then system python3
+    local py=""
+    if [[ -n "$venv_dir" && "$SKIP_VENV" != "1" && -x "$venv_dir/bin/python" ]]; then
+        py="$venv_dir/bin/python"
+    elif [[ -n "$PYTHON_CMD" ]] && command -v "$PYTHON_CMD" >/dev/null 2>&1; then
+        py="$PYTHON_CMD"
+    else
+        py="python3"
+    fi
+
+    # Always prompt so fresh installs discover the onboard wizard too.
+    # Default is Yes — users running the curl|bash installer usually want
+    # to finish end-to-end. They can answer N to skip or pass --no-onboard.
+    echo ""
+    echo -ne "${CYAN}Set up a messaging bot (Telegram / Discord / Slack / WhatsApp) now? [Y/n] ${NC}"
+    local yn=""
+    read -r yn < /dev/tty || yn=""
+    case "$yn" in
+        [nN]*)
+            log_info "Skipped — run 'praisonai onboard' anytime to set up a bot."
+            ;;
+        *)
+            if "$py" -m praisonai onboard < /dev/tty > /dev/tty 2> /dev/tty; then
+                log_success "Bot onboarding completed!"
+                BOT_ONBOARDED=1
+            else
+                log_warn "Bot onboarding skipped or failed — you can retry with 'praisonai onboard'."
+            fi
+            ;;
+    esac
 }
 
 # Main installation function
@@ -628,8 +766,18 @@ main() {
     # Verify installation
     verify_installation "$venv_dir"
     
-    # Print next steps
-    print_next_steps "$venv_dir"
+    # Run interactive onboarding
+    run_onboarding "$venv_dir"
+    
+    # Offer bot onboarding
+    maybe_offer_bot_onboarding "$venv_dir"
+
+    # Print next steps only when the bot wizard did NOT run to completion.
+    # When it did, its "✅ Done" panel is the final and most useful summary,
+    # and appending another next-steps block creates a confusing duplicate.
+    if [[ "$BOT_ONBOARDED" != "1" ]]; then
+        print_next_steps "$venv_dir"
+    fi
 }
 
 # Run main

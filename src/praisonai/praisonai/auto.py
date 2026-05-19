@@ -15,157 +15,125 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 import os
 import json
 import yaml
+import threading
 from rich import print
-import logging
+from praisonai._logging import get_logger
 
 # Type variable for Pydantic models
 T = TypeVar('T', bound=BaseModel)
 
 # =============================================================================
-# LAZY LOADING INFRASTRUCTURE - All heavy imports are deferred
+# THREAD-SAFE LAZY LOADING INFRASTRUCTURE - All heavy imports are deferred
 # =============================================================================
 
-# Cached availability flags (None = not checked yet)
-_crewai_available = None
-_autogen_available = None
-_autogen_v4_available = None
-_praisonai_available = None
-_praisonai_tools_available = None
-_litellm_available = None
-_openai_available = None
+import threading
 
-# Cached module/class references
-_crewai_classes = None  # (Agent, Task, Crew)
-_autogen_module = None
-_autogen_v4_classes = None  # (AssistantAgent, OpenAIChatCompletionClient)
-_praisonai_classes = None  # (PraisonAgent, PraisonTask, Agents)
-_praisonai_tools = None  # dict of tool classes
-_litellm = None
-_openai_client = None
+# Thread-safe lazy cache for optional dependencies
+_optional_lock = threading.Lock()
+_optional_cache: dict[str, object] = {}
+
+
+def _load_optional(key: str, loader):
+    """Thread-safe lazy loading for optional dependencies.
+    
+    Args:
+        key: Unique key for the dependency
+        loader: Function that imports and returns the dependency
+        
+    Returns:
+        The loaded dependency or None if import fails
+    """
+    if key in _optional_cache:
+        return _optional_cache[key]
+    
+    with _optional_lock:
+        if key in _optional_cache:
+            return _optional_cache[key]
+        
+        try:
+            _optional_cache[key] = loader()
+        except ImportError:
+            _optional_cache[key] = None
+        
+        return _optional_cache[key]
+
+
 
 
 # --- CrewAI lazy loading ---
+# Availability checks now delegated to centralized module
+from ._framework_availability import is_available
+
 def _check_crewai_available() -> bool:
-    """Check if crewai is available (cached)."""
-    global _crewai_available
-    if _crewai_available is None:
-        try:
-            import crewai  # noqa: F401
-            _crewai_available = True
-        except ImportError:
-            _crewai_available = False
-    return _crewai_available
+    """Check if crewai is available (cached, thread-safe)."""
+    return is_available("crewai")
+
+def _check_autogen_available() -> bool:
+    """Check if autogen v0.2 is available (cached, thread-safe)."""
+    return is_available("autogen")
+
+def _check_autogen_v4_available() -> bool:
+    """Check if autogen v0.4 is available (cached, thread-safe)."""
+    return is_available("autogen_v4")
+
+def _check_ag2_available() -> bool:
+    """Check if AG2 (community fork of AutoGen) is available (cached, thread-safe)."""
+    return is_available("ag2")
+
+def _check_praisonai_available() -> bool:
+    """Check if praisonaiagents is available (cached, thread-safe)."""
+    return is_available("praisonaiagents")
+
+def _check_praisonai_tools_available() -> bool:
+    """Check if praisonai_tools is available (cached, thread-safe)."""
+    return is_available("praisonai_tools")
+
+def _check_litellm_available() -> bool:
+    """Check if litellm is available (cached, thread-safe)."""
+    return is_available("litellm")
+
+def _check_openai_available() -> bool:
+    """Check if openai is available (cached, thread-safe)."""
+    return is_available("openai")
 
 
 def _get_crewai():
-    """Lazy load crewai classes."""
-    global _crewai_classes
-    if _crewai_classes is None:
-        from crewai import Agent, Task, Crew
-        _crewai_classes = (Agent, Task, Crew)
-    return _crewai_classes
-
-
-# --- AutoGen lazy loading ---
-def _check_autogen_available() -> bool:
-    """Check if autogen v0.2 is available (cached)."""
-    global _autogen_available
-    if _autogen_available is None:
-        try:
-            import autogen  # noqa: F401
-            _autogen_available = True
-        except ImportError:
-            _autogen_available = False
-    return _autogen_available
-
-
-def _check_autogen_v4_available() -> bool:
-    """Check if autogen v0.4 is available (cached)."""
-    global _autogen_v4_available
-    if _autogen_v4_available is None:
-        try:
-            from autogen_agentchat.agents import AssistantAgent  # noqa: F401
-            _autogen_v4_available = True
-        except ImportError:
-            _autogen_v4_available = False
-    return _autogen_v4_available
-
-
-# --- AG2 lazy loading ---
-_ag2_available = None
-
-def _check_ag2_available() -> bool:
-    """Check if AG2 (community fork of AutoGen) is available (cached)."""
-    global _ag2_available
-    if _ag2_available is None:
-        try:
-            import importlib.metadata
-            importlib.metadata.distribution('ag2')
-            from autogen import LLMConfig  # noqa: F401 — AG2-exclusive class
-            _ag2_available = True
-        except Exception:
-            _ag2_available = False
-    return _ag2_available
+    """Lazy load crewai classes (thread-safe)."""
+    return _load_optional("crewai_classes", lambda: (
+        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Agent,
+        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Task,
+        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Crew,
+    ))
 
 
 def _get_autogen():
-    """Lazy load autogen module."""
-    global _autogen_module
-    if _autogen_module is None:
-        import autogen
-        _autogen_module = autogen
-    return _autogen_module
+    """Lazy load autogen module (thread-safe)."""
+    return _load_optional("autogen_module", lambda: __import__("autogen"))
 
 
 def _get_autogen_v4():
-    """Lazy load autogen v0.4 classes."""
-    global _autogen_v4_classes
-    if _autogen_v4_classes is None:
+    """Lazy load autogen v0.4 classes (thread-safe)."""
+    def autogen_v4_loader():
         from autogen_agentchat.agents import AssistantAgent
         from autogen_ext.models.openai import OpenAIChatCompletionClient
-        _autogen_v4_classes = (AssistantAgent, OpenAIChatCompletionClient)
-    return _autogen_v4_classes
-
-
-# --- PraisonAI Agents lazy loading ---
-def _check_praisonai_available() -> bool:
-    """Check if praisonaiagents is available (cached)."""
-    global _praisonai_available
-    if _praisonai_available is None:
-        try:
-            import praisonaiagents  # noqa: F401
-            _praisonai_available = True
-        except ImportError:
-            _praisonai_available = False
-    return _praisonai_available
+        return (AssistantAgent, OpenAIChatCompletionClient)
+    
+    return _load_optional("autogen_v4_classes", autogen_v4_loader)
 
 
 def _get_praisonai():
-    """Lazy load praisonaiagents classes."""
-    global _praisonai_classes
-    if _praisonai_classes is None:
-        from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam
-        _praisonai_classes = (PraisonAgent, PraisonTask, Agents)
-    return _praisonai_classes
+    """Lazy load praisonaiagents classes (thread-safe)."""
+    def praisonai_loader():
+        from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam as Agents
+        return (PraisonAgent, PraisonTask, Agents)
+    
+    return _load_optional("praisonai_classes", praisonai_loader)
 
 
 # --- PraisonAI Tools lazy loading ---
-def _check_praisonai_tools_available() -> bool:
-    """Check if praisonai_tools is available (cached)."""
-    global _praisonai_tools_available
-    if _praisonai_tools_available is None:
-        try:
-            import praisonai_tools  # noqa: F401
-            _praisonai_tools_available = True
-        except ImportError:
-            _praisonai_tools_available = False
-    return _praisonai_tools_available
-
-
 def _get_praisonai_tools():
-    """Lazy load praisonai_tools classes."""
-    global _praisonai_tools
-    if _praisonai_tools is None:
+    """Lazy load praisonai_tools classes (thread-safe)."""
+    def tools_loader():
         from praisonai_tools import (
             CodeDocsSearchTool, CSVSearchTool, DirectorySearchTool, DOCXSearchTool,
             DirectoryReadTool, FileReadTool, TXTSearchTool, JSONSearchTool,
@@ -173,7 +141,7 @@ def _get_praisonai_tools():
             ScrapeWebsiteTool, WebsiteSearchTool, XMLSearchTool,
             YoutubeChannelSearchTool, YoutubeVideoSearchTool
         )
-        _praisonai_tools = {
+        return {
             'CodeDocsSearchTool': CodeDocsSearchTool,
             'CSVSearchTool': CSVSearchTool,
             'DirectorySearchTool': DirectorySearchTool,
@@ -192,58 +160,25 @@ def _get_praisonai_tools():
             'YoutubeChannelSearchTool': YoutubeChannelSearchTool,
             'YoutubeVideoSearchTool': YoutubeVideoSearchTool,
         }
-    return _praisonai_tools
-
-
-# --- LiteLLM lazy loading ---
-def _check_litellm_available() -> bool:
-    """Check if litellm is available (cached)."""
-    global _litellm_available
-    if _litellm_available is None:
-        try:
-            import litellm  # noqa: F401
-            _litellm_available = True
-        except ImportError:
-            _litellm_available = False
-    return _litellm_available
+    
+    return _load_optional("praisonai_tools_dict", tools_loader)
 
 
 def _get_litellm():
     """Lazy load litellm module."""
-    global _litellm
-    if _litellm is None:
-        import litellm as _litellm_module
-        _litellm = _litellm_module
-    return _litellm
+    result = _load_optional("litellm", lambda: __import__("litellm"))
+    if result is None:
+        raise ImportError("Install with: pip install litellm")
+    return result
 
 
 # --- OpenAI lazy loading ---
-def _check_openai_available() -> bool:
-    """Check if openai is available (cached)."""
-    global _openai_available
-    if _openai_available is None:
-        try:
-            import openai  # noqa: F401
-            _openai_available = True
-        except ImportError:
-            _openai_available = False
-    return _openai_available
 
 
-def _get_openai_client(api_key: str = None, base_url: str = None):
-    """Lazy load OpenAI client."""
-    global _openai_client
-    if _openai_client is None:
-        from openai import OpenAI
-        _openai_client = OpenAI(
-            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-            base_url=base_url
-        )
-    return _openai_client
 
 
-_loglevel = os.environ.get('LOGLEVEL', 'INFO').strip().upper() or 'INFO'
-logging.basicConfig(level=_loglevel, format='%(asctime)s - %(levelname)s - %(message)s')
+# Use namespaced logger; root logger is configured only by the CLI
+logger = get_logger("auto")
 
 # =============================================================================
 # Available Tools List (shared between generators) - Legacy for praisonai_tools
@@ -476,21 +411,49 @@ class BaseAutoGenerator:
         Args:
             config_list: Optional LLM configuration list
         """
-        # Support multiple environment variable patterns for better compatibility
-        model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-4o-mini")
-        base_url = (
-            os.environ.get("OPENAI_BASE_URL") or 
-            os.environ.get("OPENAI_API_BASE") or
-            os.environ.get("OLLAMA_API_BASE", "https://api.openai.com/v1")
-        )
+        # Resolve LLM endpoint configuration from environment variables
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
         
         self.config_list = config_list or [
             {
-                'model': model_name,
-                'base_url': base_url,
-                'api_key': os.environ.get("OPENAI_API_KEY")
+                'model': ep.model,
+                'base_url': ep.base_url,
+                'api_key': ep.api_key
             }
         ]
+        self._openai_client = None  # lazy, per-instance
+        self._openai_client_lock = threading.Lock()
+        
+    def _get_openai_client(self):
+        """Get or create the OpenAI client for this instance."""
+        if self._openai_client is None:
+            with self._openai_client_lock:
+                if self._openai_client is None:
+                    try:
+                        from openai import OpenAI
+                    except ImportError as e:
+                        raise ImportError("Install with: pip install openai") from e
+                    cfg = self.config_list[0]
+                    self._openai_client = OpenAI(
+                        api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
+                        base_url=cfg.get("base_url"),
+                    )
+        return self._openai_client
+
+    def close(self):
+        """Close the OpenAI client if it exists."""
+        if not hasattr(self, '_openai_client_lock'):
+            return  # Object was never fully initialized
+        with self._openai_client_lock:
+            client = getattr(self, '_openai_client', None)
+            self._openai_client = None
+        if client is not None:
+            client.close()
+
+    def __del__(self):
+        """Best-effort cleanup, but the canonical path is explicit close()."""
+        self.close()
     
     def _structured_completion(self, response_model: Type[T], messages: List[Dict], **kwargs) -> T:
         """
@@ -527,10 +490,7 @@ class BaseAutoGenerator:
         
         # Fallback to OpenAI SDK (uses beta.chat.completions.parse)
         if _check_openai_available():
-            client = _get_openai_client(
-                api_key=self.config_list[0].get('api_key'),
-                base_url=self.config_list[0].get('base_url')
-            )
+            client = self._get_openai_client()
             response = client.beta.chat.completions.parse(
                 model=model_name,
                 messages=messages,
@@ -641,7 +601,8 @@ class AutoGenerator(BaseAutoGenerator):
     
     def __init__(self, topic="Movie Story writing about AI", agent_file="test.yaml", 
                  framework="crewai", config_list: Optional[List[Dict]] = None,
-                 pattern: str = "sequential", single_agent: bool = False):
+                 pattern: str = "sequential", single_agent: bool = False, 
+                 adapter_registry=None):
         """
         Initialize the AutoGenerator class with the specified topic, agent file, and framework.
         
@@ -658,42 +619,28 @@ class AutoGenerator(BaseAutoGenerator):
         # Initialize base class first (handles config_list and client)
         super().__init__(config_list=config_list)
         
-        # Validate framework availability and show framework-specific messages
-        if framework == "crewai" and not _check_crewai_available():
-            raise ImportError("""
-CrewAI is not installed. Please install with:
-    pip install "praisonai[crewai]"
-""")
-        elif framework == "autogen" and not (_check_autogen_available() or _check_autogen_v4_available()):
-            raise ImportError("""
-AutoGen is not installed. Please install with:
-    pip install "praisonai[autogen]" for v0.2
-    pip install "praisonai[autogen-v4]" for v0.4
-""")
-        elif framework == "praisonai" and not _check_praisonai_available():
-            raise ImportError("""
-Praisonai is not installed. Please install with:
-    pip install praisonaiagents
-""")
-        elif framework == "ag2" and not _check_ag2_available():
-            raise ImportError("""
-AG2 is not installed. Please install with:
-    pip install "praisonai[ag2]"
-""")
+        # Validate framework availability using adapter registry
+        from .framework_adapters.registry import get_default_registry
+        
+        self._adapter_registry = adapter_registry or get_default_registry()
+        try:
+            adapter = self._adapter_registry.create(framework)
+        except ValueError as e:
+            raise ImportError(
+                f"Unknown framework '{framework}'. Available frameworks: "
+                f"{', '.join(self._adapter_registry.list_registered())}"
+            ) from e
 
-        # Only show tools message if using a framework and tools are needed
-        if (framework in ["crewai", "autogen"]) and not _check_praisonai_tools_available():
-            if framework == "autogen":
-                logging.warning("""
-Tools are not available for autogen. To use tools, install:
-    pip install "praisonai[autogen]" for v0.2
-    pip install "praisonai[autogen-v4]" for v0.4
-""")
-            else:
-                logging.warning(f"""
-Tools are not available for {framework}. To use tools, install:
-    pip install "praisonai[{framework}]"
-""")
+        # Use safe fallbacks for new adapter attributes
+        install_hint = getattr(adapter, "install_hint", f"pip install {framework}")
+        requires_tools_extra = bool(getattr(adapter, "requires_tools_extra", False))
+        
+        if not adapter.is_available():
+            raise ImportError(f"{adapter.name} is not installed. Please install with:\n    {install_hint}")
+        
+        # Check tools availability if required by this framework
+        if requires_tools_extra and not _check_praisonai_tools_available():
+            logger.warning(f"Tools are not available for {framework}. To use tools, install:\n    {install_hint}")
 
         self.topic = topic
         self.agent_file = agent_file
@@ -820,8 +767,8 @@ Tools are not available for {framework}. To use tools, install:
                 # If existing file is empty, treat as new file
                 existing_data = {"roles": {}, "dependencies": []}
         except (yaml.YAMLError, FileNotFoundError) as e:
-            logging.warning(f"Could not load existing agents file {self.agent_file}: {e}")
-            logging.warning("Creating new file instead of merging")
+            logger.warning(f"Could not load existing agents file {self.agent_file}: {e}")
+            logger.warning("Creating new file instead of merging")
             existing_data = {"roles": {}, "dependencies": []}
         
         # Start with existing data structure
@@ -1191,7 +1138,7 @@ Respond with:
             if not existing_data:
                 return new_data
         except (yaml.YAMLError, FileNotFoundError) as e:
-            logging.warning(f"Could not load existing workflow file {self.workflow_file}: {e}")
+            logger.warning(f"Could not load existing workflow file {self.workflow_file}: {e}")
             return new_data
         
         # Merge agents (avoid duplicates)

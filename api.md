@@ -172,6 +172,7 @@ Methods:
 * <code title="class BaseTool">BaseTool.<a href="./src/praisonai-agents/praisonaiagents/tools/base.py">validate</a>() -> bool</code>
 * <code title="class BaseTool">BaseTool.<a href="./src/praisonai-agents/praisonaiagents/tools/base.py">validate_class</a>() -> bool</code>
 * <code title="class FunctionTool">FunctionTool.<a href="./src/praisonai-agents/praisonaiagents/tools/decorator.py">__call__</a>(*args, **kwargs) -> Any</code>
+* <code title="class FunctionTool">FunctionTool.<a href="./src/praisonai-agents/praisonaiagents/tools/decorator.py">check_availability</a>() -> tuple[bool, str]</code>
 * <code title="class FunctionTool">FunctionTool.<a href="./src/praisonai-agents/praisonaiagents/tools/decorator.py">injected_params</a>() -> Dict[str, Any]</code>
 * <code title="class FunctionTool">FunctionTool.<a href="./src/praisonai-agents/praisonaiagents/tools/decorator.py">run</a>(**kwargs) -> Any</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">clear</a>() -> None</code>
@@ -179,6 +180,7 @@ Methods:
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">discover_single_file_plugins</a>() -> int</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get</a>(name: str) -> Optional[Union[BaseTool, Callable]]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get_all</a>() -> Dict[str, Union[BaseTool, Callable]]</code>
+* <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">list_available_tools</a>(context: Optional[Dict[str, Any]] = None) -> List[Union[BaseTool, Callable]]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">list_base_tools</a>() -> List[BaseTool]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">list_tools</a>() -> List[str]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">register</a>(tool: Union[BaseTool, Callable], name: Optional[str] = None, overwrite: bool = False) -> None</code>
@@ -206,11 +208,12 @@ Methods:
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">execute_callback_sync</a>(task_output: TaskOutput) -> None</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">get_next_task</a>(context: Dict[str, Any]) -> Optional[str]</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">initialize_memory</a>()</code>
+* <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">initialize_memory_async</a>()</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">set_status</a>(new_status: str) -> None</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">store_in_memory</a>(content: str, agent_name: str = None, task_id: str = None)</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">to_dict</a>() -> Dict[str, Any]</code>
 * <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">loop</a>(step: Any = None, steps: Optional[List[Any]] = None, over: Optional[str] = None, from_csv: Optional[str] = None, from_file: Optional[str] = None, var_name: str = 'item', parallel: bool = False, max_workers: Optional[int] = None, output_variable: Optional[str] = None) -> Loop</code>
-* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">parallel</a>(steps: List) -> Parallel</code>
+* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">parallel</a>(steps: List, max_workers: Optional[int] = None, on_failure: str = 'partial_ok') -> Parallel</code>
 * <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">repeat</a>(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None, max_iterations: int = 10) -> Repeat</code>
 * <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">route</a>(routes: Dict[str, List], default: Optional[List] = None) -> Route</code>
 
@@ -467,14 +470,23 @@ Methods:
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">activate_by_name</a>(name: str) -> bool</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">add_skill</a>(skill_path: str) -> Optional[LoadedSkill]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">clear</a>() -> None</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">create_skill</a>(name: str, content: str, category: str = None) -> dict</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">delete_skill</a>(name: str) -> dict</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">discover</a>(skill_dirs: Optional[List[str]] = None, include_defaults: bool = True) -> int</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">edit_skill</a>(name: str, content: str) -> dict</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">get_allowed_tools</a>(name: str) -> List[str]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">get_available_skills</a>() -> List[SkillMetadata]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">get_instructions</a>(name: str) -> Optional[str]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">get_skill</a>(name: str) -> Optional[LoadedSkill]</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">get_user_invocable_skills</a>() -> List[LoadedSkill]</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">invoke</a>(name: str, raw_args: str = '', session_id: Optional[str] = None, shell_exec: bool = False) -> Optional[str]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">load_resources</a>(name: str) -> bool</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">patch_skill</a>(name: str, old_string: str, new_string: str, file_path: str = None, replace_all: bool = False) -> dict</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">remove_skill_file</a>(name: str, file_path: str) -> dict</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">skill_names</a>() -> List[str]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">skills</a>() -> List[LoadedSkill]</code>
 * <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">to_prompt</a>() -> str</code>
+* <code title="class SkillManager">SkillManager.<a href="./src/praisonai-agents/praisonaiagents/skills/manager.py">write_skill_file</a>(name: str, file_path: str, file_content: str) -> dict</code>
 * <code title="class SkillMetadata">SkillMetadata.<a href="./src/praisonai-agents/praisonaiagents/skills/models.py">from_properties</a>(props: SkillProperties) -> 'SkillMetadata'</code>
 * <code title="class SkillProperties">SkillProperties.<a href="./src/praisonai-agents/praisonaiagents/skills/models.py">to_dict</a>() -> dict</code>
 * <code title="class SkillsConfig">SkillsConfig.<a href="./src/praisonai-agents/praisonaiagents/config/feature_configs.py">to_dict</a>() -> Dict[str, Any]</code>
@@ -701,6 +713,7 @@ Methods:
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">astart</a>(content = None, return_dict = False, **kwargs)</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">clean_json_output</a>(output: str) -> str</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">clear_state</a>() -> None</code>
+* <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">close</a>() -> None</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">context_manager</a>()</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">current_plan</a>()</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">default_completion_checker</a>(task, agent_output)</code>
@@ -742,7 +755,7 @@ Methods:
 
 Types:
 ```python
-from praisonai import AgentApp, AgentOS, AnthropicManagedAgent, CloudProvider, DB, Deploy, DeployConfig, DeployType, LocalManagedAgent, LocalManagedConfig, ManagedAgent, ManagedConfig, PraisonAI, __version__
+from praisonai import Agent, AgentApp, AgentOS, AnthropicManagedAgent, CloudProvider, DB, Deploy, DeployConfig, DeployType, HostedAgent, HostedAgentConfig, LocalAgent, LocalAgentConfig, LocalManagedAgent, LocalManagedConfig, ManagedAgent, ManagedConfig, PraisonAI, __version__
 ```
 
 # CLI
@@ -772,6 +785,11 @@ Methods:
 * <code title="cli">praisonai bot bot-callback <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
 * <code title="cli">praisonai bot discord <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
 * <code title="cli">praisonai bot email <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
+* <code title="cli">praisonai bot install-daemon <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
+* <code title="cli">praisonai bot linear <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
+* <code title="cli">praisonai bot list <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
+* <code title="cli">praisonai bot purge <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
+* <code title="cli">praisonai bot replay <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
 * <code title="cli">praisonai bot slack <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
 * <code title="cli">praisonai bot start <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
 * <code title="cli">praisonai bot telegram <a href="./src/praisonai/praisonai/cli/commands/bot.py">--help</a></code>
@@ -812,6 +830,7 @@ Methods:
 * <code title="cli">praisonai context show <a href="./src/praisonai/praisonai/cli/commands/context.py">--help</a></code>
 * <code title="cli">praisonai context stats <a href="./src/praisonai/praisonai/cli/commands/context.py">--help</a></code>
 * <code title="cli">praisonai context tail <a href="./src/praisonai/praisonai/cli/commands/context.py">--help</a></code>
+* <code title="cli">praisonai dashboard unified <a href="./src/praisonai/praisonai/cli/commands/dashboard.py">--help</a></code>
 * <code title="cli">praisonai debug acp <a href="./src/praisonai/praisonai/cli/commands/debug.py">--help</a></code>
 * <code title="cli">praisonai debug debug-callback <a href="./src/praisonai/praisonai/cli/commands/debug.py">--help</a></code>
 * <code title="cli">praisonai debug interactive <a href="./src/praisonai/praisonai/cli/commands/debug.py">--help</a></code>
@@ -851,19 +870,27 @@ Methods:
 * <code title="cli">praisonai eval judge <a href="./src/praisonai/praisonai/cli/commands/eval.py">--help</a></code>
 * <code title="cli">praisonai eval list-judges <a href="./src/praisonai/praisonai/cli/commands/eval.py">--help</a></code>
 * <code title="cli">praisonai eval performance <a href="./src/praisonai/praisonai/cli/commands/eval.py">--help</a></code>
+* <code title="cli">praisonai examples find <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples info <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples list <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples report <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples run <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples run-all <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
 * <code title="cli">praisonai examples stats <a href="./src/praisonai/praisonai/cli/commands/examples.py">--help</a></code>
+* <code title="cli">praisonai flow export <a href="./src/praisonai/praisonai/cli/commands/flow.py">--help</a></code>
 * <code title="cli">praisonai flow flow-start <a href="./src/praisonai/praisonai/cli/commands/flow.py">--help</a></code>
+* <code title="cli">praisonai flow import <a href="./src/praisonai/praisonai/cli/commands/flow.py">--help</a></code>
+* <code title="cli">praisonai flow list <a href="./src/praisonai/praisonai/cli/commands/flow.py">--help</a></code>
 * <code title="cli">praisonai flow version <a href="./src/praisonai/praisonai/cli/commands/flow.py">--help</a></code>
 * <code title="cli">praisonai gateway channels <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
 * <code title="cli">praisonai gateway gateway-callback <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
+* <code title="cli">praisonai gateway install <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
+* <code title="cli">praisonai gateway logs <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
+* <code title="cli">praisonai gateway mint-link <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
 * <code title="cli">praisonai gateway send <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
 * <code title="cli">praisonai gateway start <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
 * <code title="cli">praisonai gateway status <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
+* <code title="cli">praisonai gateway uninstall <a href="./src/praisonai/praisonai/cli/commands/gateway.py">--help</a></code>
 * <code title="cli">praisonai github triage <a href="./src/praisonai/praisonai/cli/commands/github.py">--help</a></code>
 * <code title="cli">praisonai hooks add <a href="./src/praisonai/praisonai/cli/commands/hooks.py">--help</a></code>
 * <code title="cli">praisonai hooks list <a href="./src/praisonai/praisonai/cli/commands/hooks.py">--help</a></code>
@@ -872,6 +899,8 @@ Methods:
 * <code title="cli">praisonai knowledge index <a href="./src/praisonai/praisonai/cli/commands/knowledge.py">--help</a></code>
 * <code title="cli">praisonai knowledge list <a href="./src/praisonai/praisonai/cli/commands/knowledge.py">--help</a></code>
 * <code title="cli">praisonai knowledge search <a href="./src/praisonai/praisonai/cli/commands/knowledge.py">--help</a></code>
+* <code title="cli">praisonai langextract render <a href="./src/praisonai/praisonai/cli/commands/langextract.py">--help</a></code>
+* <code title="cli">praisonai langextract view <a href="./src/praisonai/praisonai/cli/commands/langextract.py">--help</a></code>
 * <code title="cli">praisonai langfuse config <a href="./src/praisonai/praisonai/cli/commands/langfuse.py">--help</a></code>
 * <code title="cli">praisonai langfuse connect <a href="./src/praisonai/praisonai/cli/commands/langfuse.py">--help</a></code>
 * <code title="cli">praisonai langfuse init <a href="./src/praisonai/praisonai/cli/commands/langfuse.py">--help</a></code>
@@ -890,6 +919,7 @@ Methods:
 * <code title="cli">praisonai lsp start <a href="./src/praisonai/praisonai/cli/commands/lsp.py">--help</a></code>
 * <code title="cli">praisonai lsp status <a href="./src/praisonai/praisonai/cli/commands/lsp.py">--help</a></code>
 * <code title="cli">praisonai lsp stop <a href="./src/praisonai/praisonai/cli/commands/lsp.py">--help</a></code>
+* <code title="cli">praisonai managed delete <a href="./src/praisonai/praisonai/cli/commands/managed.py">--help</a></code>
 * <code title="cli">praisonai managed get <a href="./src/praisonai/praisonai/cli/commands/managed.py">--help</a></code>
 * <code title="cli">praisonai managed list <a href="./src/praisonai/praisonai/cli/commands/managed.py">--help</a></code>
 * <code title="cli">praisonai managed managed-callback <a href="./src/praisonai/praisonai/cli/commands/managed.py">--help</a></code>
@@ -917,10 +947,22 @@ Methods:
 * <code title="cli">praisonai memory search <a href="./src/praisonai/praisonai/cli/commands/memory.py">--help</a></code>
 * <code title="cli">praisonai memory show <a href="./src/praisonai/praisonai/cli/commands/memory.py">--help</a></code>
 * <code title="cli">praisonai memory status <a href="./src/praisonai/praisonai/cli/commands/memory.py">--help</a></code>
+* <code title="cli">praisonai n8n export <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n import <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n list <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n preview <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n pull <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n push <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
+* <code title="cli">praisonai n8n test <a href="./src/praisonai/praisonai/cli/commands/n8n.py">--help</a></code>
 * <code title="cli">praisonai obs obs-fallback <a href="./src/praisonai/praisonai/cli/commands/obs.py">--help</a></code>
+* <code title="cli">praisonai onboard onboard-callback <a href="./src/praisonai/praisonai/cli/commands/onboard.py">--help</a></code>
 * <code title="cli">praisonai package install <a href="./src/praisonai/praisonai/cli/commands/package.py">--help</a></code>
 * <code title="cli">praisonai package list <a href="./src/praisonai/praisonai/cli/commands/package.py">--help</a></code>
 * <code title="cli">praisonai package uninstall <a href="./src/praisonai/praisonai/cli/commands/package.py">--help</a></code>
+* <code title="cli">praisonai pairing approve <a href="./src/praisonai/praisonai/cli/commands/pairing.py">--help</a></code>
+* <code title="cli">praisonai pairing clear <a href="./src/praisonai/praisonai/cli/commands/pairing.py">--help</a></code>
+* <code title="cli">praisonai pairing list <a href="./src/praisonai/praisonai/cli/commands/pairing.py">--help</a></code>
+* <code title="cli">praisonai pairing revoke <a href="./src/praisonai/praisonai/cli/commands/pairing.py">--help</a></code>
 * <code title="cli">praisonai paths show <a href="./src/praisonai/praisonai/cli/commands/paths.py">--help</a></code>
 * <code title="cli">praisonai plugins create <a href="./src/praisonai/praisonai/cli/commands/plugins.py">--help</a></code>
 * <code title="cli">praisonai plugins disable <a href="./src/praisonai/praisonai/cli/commands/plugins.py">--help</a></code>
@@ -1017,6 +1059,10 @@ Methods:
 * <code title="cli">praisonai session list <a href="./src/praisonai/praisonai/cli/commands/session.py">--help</a></code>
 * <code title="cli">praisonai session resume <a href="./src/praisonai/praisonai/cli/commands/session.py">--help</a></code>
 * <code title="cli">praisonai session show <a href="./src/praisonai/praisonai/cli/commands/session.py">--help</a></code>
+* <code title="cli">praisonai setup config <a href="./src/praisonai/praisonai/cli/commands/setup.py">--help</a></code>
+* <code title="cli">praisonai setup reset <a href="./src/praisonai/praisonai/cli/commands/setup.py">--help</a></code>
+* <code title="cli">praisonai setup setup-callback <a href="./src/praisonai/praisonai/cli/commands/setup.py">--help</a></code>
+* <code title="cli">praisonai setup wizard <a href="./src/praisonai/praisonai/cli/commands/setup.py">--help</a></code>
 * <code title="cli">praisonai skills check <a href="./src/praisonai/praisonai/cli/commands/skills.py">--help</a></code>
 * <code title="cli">praisonai skills create <a href="./src/praisonai/praisonai/cli/commands/skills.py">--help</a></code>
 * <code title="cli">praisonai skills eligible <a href="./src/praisonai/praisonai/cli/commands/skills.py">--help</a></code>
@@ -1056,8 +1102,13 @@ Methods:
 * <code title="cli">praisonai train llm <a href="./src/praisonai/praisonai/cli/commands/train.py">--help</a></code>
 * <code title="cli">praisonai train show <a href="./src/praisonai/praisonai/cli/commands/train.py">--help</a></code>
 * <code title="cli">praisonai train train-callback <a href="./src/praisonai/praisonai/cli/commands/train.py">--help</a></code>
+* <code title="cli">praisonai ui agents <a href="./src/praisonai/praisonai/cli/commands/ui.py">--help</a></code>
+* <code title="cli">praisonai ui bot <a href="./src/praisonai/praisonai/cli/commands/ui.py">--help</a></code>
+* <code title="cli">praisonai ui realtime <a href="./src/praisonai/praisonai/cli/commands/ui.py">--help</a></code>
 * <code title="cli">praisonai ui ui <a href="./src/praisonai/praisonai/cli/commands/ui.py">--help</a></code>
-* <code title="cli">praisonai unified unified <a href="./src/praisonai/praisonai/cli/commands/unified.py">--help</a></code>
+* <code title="cli">praisonai up logs <a href="./src/praisonai/praisonai/cli/commands/up.py">--help</a></code>
+* <code title="cli">praisonai up status <a href="./src/praisonai/praisonai/cli/commands/up.py">--help</a></code>
+* <code title="cli">praisonai up up-start <a href="./src/praisonai/praisonai/cli/commands/up.py">--help</a></code>
 * <code title="cli">praisonai version check <a href="./src/praisonai/praisonai/cli/commands/version.py">--help</a></code>
 * <code title="cli">praisonai version show <a href="./src/praisonai/praisonai/cli/commands/version.py">--help</a></code>
 * <code title="cli">praisonai version version-callback <a href="./src/praisonai/praisonai/cli/commands/version.py">--help</a></code>

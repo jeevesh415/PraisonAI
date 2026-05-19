@@ -53,7 +53,15 @@ app = FastAPI()
 # Set up logging
 logger = logging.getLogger(__name__)
 log_level = os.getenv("LOGLEVEL", "INFO").upper()
-logger.handlers = []
+logger.handlers.clear()
+
+# Include agent invoke router for n8n integration
+try:
+    from .agent_invoke import router as agent_invoke_router
+    app.include_router(agent_invoke_router)
+    logger.debug("Agent invoke router added for n8n integration")
+except ImportError as e:
+    logger.warning(f"Could not load agent invoke router: {e}")
 
 # Try to import tools from the root directory
 tools = []
@@ -61,11 +69,25 @@ tools_path = os.path.join(os.getcwd(), 'tools.py')
 logger.debug(f"Tools path: {tools_path}")
 
 def import_tools_from_file(file_path):
-    spec = importlib.util.spec_from_file_location("custom_tools", file_path)
-    custom_tools_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(custom_tools_module)
-    logger.debug(f"Imported tools from {file_path}")
-    return custom_tools_module
+    """Import tools from file with PRAISONAI_ALLOW_LOCAL_TOOLS opt-in.
+    
+    This function is reachable from network input via API requests.
+    Additional security: only allow files under the current working directory.
+    """
+    from .._safe_loader import load_user_module_strict, LocalToolsDisabled
+    try:
+        custom_tools_module = load_user_module_strict(file_path, name="custom_tools")
+        logger.debug(f"Imported tools from {file_path}")
+        return custom_tools_module
+    except LocalToolsDisabled as e:
+        logger.warning(f"Tools loading disabled: {e}")
+        raise ValueError("Local tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")
+    except FileNotFoundError as e:
+        logger.warning(f"Tools file not found: {e}")
+        raise ValueError(f"Tools file not found: {file_path}")
+    except Exception as e:
+        logger.error("Failed to import tools from %s", file_path, exc_info=True)
+        raise ValueError(f"Failed to import tools from {file_path}") from e
 
 try:
     # Security: Require explicit opt-in for local tools loading

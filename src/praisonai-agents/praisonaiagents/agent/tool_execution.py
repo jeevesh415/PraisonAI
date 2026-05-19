@@ -17,6 +17,8 @@ import concurrent.futures
 from typing import List, Optional, Any, Dict, Union, TYPE_CHECKING
 from ..errors import ToolExecutionError
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     pass
 
@@ -192,6 +194,21 @@ class ToolExecutionMixin:
                 if res.output and res.output.modified_data:
                     arguments.update(res.output.modified_data)
 
+            # C4 — optional tool-argument validation via ToolValidatorProtocol.
+            # Zero overhead when not set. Users wire via `agent._tool_validator = MyValidator()`.
+            _validator = getattr(self, '_tool_validator', None)
+            if _validator is not None:
+                try:
+                    _vres = _validator.validate_args(function_name, arguments)
+                    if _vres is not None and not getattr(_vres, 'valid', True):
+                        _errs = "; ".join(getattr(_vres, 'errors', []) or ["validation failed"])
+                        logging.warning(
+                            f"Tool {function_name} args rejected by validator: {_errs}"
+                        )
+                        return f"Tool arguments rejected: {_errs}"
+                except Exception as _ve:  # noqa: BLE001 — never break tool exec on validator bug
+                    logging.debug(f"Tool validator raised; skipping validation: {_ve}")
+
             # P8/G11: Apply tool timeout if configured
             tool_timeout = getattr(self, '_tool_timeout', None)
             if tool_timeout and tool_timeout > 0:
@@ -200,30 +217,24 @@ class ToolExecutionMixin:
                 
                 def execute_with_context():
                     with with_injection_context(state):
-                        return self._execute_tool_impl(function_name, arguments)
+                        return self._execute_tool_with_circuit_breaker(function_name, arguments)
                 
-                # Use explicit executor lifecycle to actually bound execution time
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                # Use reusable executor to prevent resource leaks
+                if not hasattr(self, '_tool_executor'):
+                    self._tool_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix=f"tool-{self.name}"
+                    )
+                
+                future = self._tool_executor.submit(ctx.run, execute_with_context)
                 try:
-                    future = executor.submit(ctx.run, execute_with_context)
-                    try:
-                        result = future.result(timeout=tool_timeout)
-                    except concurrent.futures.TimeoutError:
-                        # Cancel and shutdown immediately to avoid blocking
-                        future.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
-                        result = {"error": f"Tool timed out after {tool_timeout}s", "timeout": True}
-                    else:
-                        # Normal completion - shutdown gracefully
-                        executor.shutdown(wait=False)
-                finally:
-                    # Ensure executor is always cleaned up
-                    if not executor._shutdown:
-                        executor.shutdown(wait=False)
+                    result = future.result(timeout=tool_timeout)
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
+                    result = {"error": f"Tool timed out after {tool_timeout}s", "timeout": True}
             else:
                 with with_injection_context(state):
-                    result = self._execute_tool_impl(function_name, arguments)
+                    result = self._execute_tool_with_circuit_breaker(function_name, arguments)
             
             # Apply tool output truncation to prevent context overflow
             # Uses context manager budget if enabled, otherwise applies default limit
@@ -344,7 +355,19 @@ class ToolExecutionMixin:
         
         # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
         self._process_auto_learning()
-        
+
+        # Periodic nudge (opt-in via LearnConfig(nudge_interval>0)).
+        # Appends a system note to chat_history so it is visible on the NEXT
+        # LLM call — encourages the agent to persist non-trivial procedures
+        # as skills/memory. No-op when nudge_interval=0 (default).
+        try:
+            nudge = self._maybe_emit_nudge(prompt if isinstance(prompt, str) else str(prompt))
+            if nudge and hasattr(self, "chat_history") and isinstance(self.chat_history, list):
+                self._append_to_chat_history({"role": "system", "content": nudge.strip()})
+        except Exception as e:
+            # Log learning nudge failures for debugging
+            logger.warning("Learning nudge generation failed: %s", e, exc_info=True)
+
         return response
 
     async def _atrigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
@@ -371,7 +394,16 @@ class ToolExecutionMixin:
         
         # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
         self._process_auto_learning()
-        
+
+        # Periodic nudge (opt-in via LearnConfig(nudge_interval>0)).
+        try:
+            nudge = self._maybe_emit_nudge(prompt if isinstance(prompt, str) else str(prompt))
+            if nudge and hasattr(self, "chat_history") and isinstance(self.chat_history, list):
+                self._append_to_chat_history({"role": "system", "content": nudge.strip()})
+        except Exception as e:
+            # Log learning nudge failures for debugging
+            logger.warning("Learning nudge generation failed: %s", e, exc_info=True)
+
         return response
 
     def _calculate_llm_cost(self, prompt_tokens: int, completion_tokens: int, response: any = None) -> float:
@@ -577,6 +609,73 @@ class ToolExecutionMixin:
             logging.info(f"Using modified arguments: {arguments}")
         return None, arguments
 
+    def _execute_tool_with_circuit_breaker(self, function_name, arguments):
+        """Execute tool with circuit breaker protection.
+        
+        Args:
+            function_name: Name of the tool to execute
+            arguments: Arguments for the tool
+            
+        Returns:
+            Tool execution result or circuit breaker error
+        """
+        # Import circuit breaker components first (lazy import for performance)
+        try:
+            from ..tools.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig, CircuitBreakerException
+        except ImportError:
+            # Circuit breaker not available - fallback to direct execution
+            logging.debug("Circuit breaker not available, falling back to direct tool execution")
+            return self._execute_tool_impl(function_name, arguments)
+
+        try:
+            
+            # Get or create circuit breaker for this tool
+            breaker_name = f"tool_{function_name}"
+            config = CircuitBreakerConfig(
+                failure_threshold=5,        # Open after 5 failures
+                recovery_timeout=60.0,      # Wait 60s before trying half-open
+                timeout=30.0,               # Tool call timeout
+                graceful_degradation=True   # Return error instead of raising exception
+            )
+            breaker = get_circuit_breaker(breaker_name, config)
+            
+            # Execute tool through circuit breaker with failure detection wrapper
+            def _tool_wrapper():
+                result = self._execute_tool_impl(function_name, arguments)
+                # Convert error dicts to exceptions so circuit breaker can detect failures
+                # Don't treat approval/permission denials as circuit breaker failures
+                if isinstance(result, dict) and result.get("error") and \
+                   not result.get("approval_denied") and \
+                   not result.get("permission_denied") and \
+                   not result.get("approval_error"):
+                    # Create a sentinel exception to register failure with circuit breaker
+                    class _ToolFailure(Exception):
+                        def __init__(self, error_dict):
+                            self.error_dict = error_dict
+                            super().__init__(error_dict.get("error", "Tool execution failed"))
+                    raise _ToolFailure(result)
+                return result
+            
+            try:
+                return breaker.call(_tool_wrapper)
+            except Exception as e:
+                # Check if this is our sentinel exception
+                if hasattr(e, 'error_dict'):
+                    return e.error_dict  # Return the original error dict
+                else:
+                    raise  # Re-raise other exceptions
+            
+        except CircuitBreakerException as e:
+            # Circuit breaker is open - return error dict instead of raising
+            logging.warning(f"Tool '{function_name}' circuit breaker open: {e}")
+            return {
+                "error": f"Tool '{function_name}' circuit breaker open - too many recent failures",
+                "circuit_open": True,
+                "agent_name": getattr(self, "name", None),
+                "session_id": getattr(self, "_session_id", None),
+                "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
+            }
+
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""
 
@@ -674,11 +773,9 @@ class ToolExecutionMixin:
                 pass
         
         if func is None:
-            # If not found in tools or registry, try globals and main
-            func = globals().get(function_name)
-            if not func:
-                import __main__
-                func = getattr(__main__, function_name, None)
+            # Tool not found in declared tools or registry — do not fall back to
+            # globals() or __main__ as that allows undeclared callables to execute.
+            pass
 
         if func:
             try:
@@ -743,12 +840,18 @@ class ToolExecutionMixin:
 
         tracking_id = str(uuid.uuid4())[:8]
         task = asyncio.ensure_future(backend.request_approval(request))
-        self._pending_approvals[tracking_id] = {
-            "task": task,
-            "function_name": function_name,
-            "arguments": arguments,
-            "request": request,
-        }
+        
+        # Make defensive copy to prevent TOCTOU mutations
+        import copy
+        frozen_args = copy.deepcopy(arguments)
+        
+        async with self._approvals_lock:
+            self._pending_approvals[tracking_id] = {
+                "task": task,
+                "function_name": function_name,
+                "arguments": frozen_args,
+                "request": request,
+            }
         logging.info(f"Approval request submitted: {tracking_id} for {function_name}")
         return tracking_id
 
@@ -760,40 +863,63 @@ class ToolExecutionMixin:
         and their results included.
         """
         results = {}
-        completed_ids = []
+        # Collect completed items under the lock, then execute tools outside the lock
+        # to avoid holding it during potentially slow async tool execution.
+        approved_items = []
+        denied_items = []
+        error_items = []
 
-        for tid, info in self._pending_approvals.items():
-            task = info["task"]
-            if task.done():
-                completed_ids.append(tid)
-                try:
-                    decision = task.result()
-                    if decision.approved:
-                        # Auto-execute the approved tool
-                        tool_result = await self.execute_tool_async(
-                            info["function_name"], info["arguments"],
-                        )
-                        results[tid] = {
-                            "status": "approved_and_executed",
-                            "tool_name": info["function_name"],
-                            "decision": decision,
-                            "result": tool_result,
-                        }
-                    else:
-                        results[tid] = {
-                            "status": "denied",
-                            "tool_name": info["function_name"],
-                            "decision": decision,
-                        }
-                except Exception as e:
-                    results[tid] = {
-                        "status": "error",
-                        "tool_name": info["function_name"],
-                        "error": str(e),
-                    }
+        async with self._approvals_lock:
+            completed_ids = []
+            for tid, info in list(self._pending_approvals.items()):
+                task = info["task"]
+                if task.done():
+                    completed_ids.append(tid)
+                    try:
+                        decision = task.result()
+                        if decision.approved:
+                            approved_items.append((tid, info, decision))
+                        else:
+                            denied_items.append((tid, info, decision))
+                    except Exception as e:
+                        error_items.append((tid, info, e))
 
-        for tid in completed_ids:
-            del self._pending_approvals[tid]
+            # Remove completed entries while still holding the lock
+            for tid in completed_ids:
+                del self._pending_approvals[tid]
+
+        # Execute approved tools outside the lock to avoid long lock hold
+        for tid, info, decision in approved_items:
+            try:
+                tool_result = await self.execute_tool_async(
+                    info["function_name"], info["arguments"],
+                )
+                results[tid] = {
+                    "status": "approved_and_executed",
+                    "tool_name": info["function_name"],
+                    "decision": decision,
+                    "result": tool_result,
+                }
+            except Exception as e:
+                results[tid] = {
+                    "status": "error",
+                    "tool_name": info["function_name"],
+                    "error": str(e),
+                }
+
+        for tid, info, decision in denied_items:
+            results[tid] = {
+                "status": "denied",
+                "tool_name": info["function_name"],
+                "decision": decision,
+            }
+
+        for tid, info, exc in error_items:
+            results[tid] = {
+                "status": "error",
+                "tool_name": info["function_name"],
+                "error": str(exc),
+            }
 
         return results
 

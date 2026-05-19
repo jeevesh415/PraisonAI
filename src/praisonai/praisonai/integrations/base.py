@@ -16,6 +16,20 @@ from typing import AsyncIterator, Optional, Dict, Any, Tuple, List
 import asyncio
 import shutil
 import os
+import threading
+
+
+class CLIExecutionError(RuntimeError):
+    """Raised when a CLI command fails with non-zero exit code."""
+    
+    def __init__(self, cmd: List[str], returncode: int, stderr: str):
+        stderr_excerpt = stderr.strip()[:500] if stderr.strip() else "(no error message)"
+        cmd_str = ' '.join(cmd) if cmd else "unknown command"
+        hint = f"Hint: ensure the CLI is installed and authenticated; try '{cmd_str} --help' or rerun the command manually."
+        super().__init__(f"{cmd[0]} exited {returncode}: {stderr_excerpt}. {hint}")
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr = stderr
 
 
 class BaseCLIIntegration(ABC):
@@ -46,9 +60,11 @@ class BaseCLIIntegration(ABC):
                     yield line
     """
     
-    # Class-level cache for availability checks (shared across instances)
+    # Class-level cache for availability checks (shared across instances).
+    # Access is guarded by _availability_cache_lock for thread-safety.
     _availability_cache: Dict[str, bool] = {}
-    
+    _availability_cache_lock = threading.Lock()
+
     def __init__(self, workspace: str = ".", timeout: int = 300):
         """
         Initialize the CLI integration.
@@ -78,14 +94,20 @@ class BaseCLIIntegration(ABC):
         """
         Check if the CLI tool is installed and available.
         
-        Uses class-level caching to avoid repeated filesystem checks.
+        Uses class-level caching (guarded by a lock) to avoid repeated
+        filesystem checks across instances and threads.
         
         Returns:
             bool: True if the CLI is available, False otherwise
         """
-        if self.cli_command not in self._availability_cache:
-            self._availability_cache[self.cli_command] = shutil.which(self.cli_command) is not None
-        return self._availability_cache[self.cli_command]
+        cmd = self.cli_command
+        cache = BaseCLIIntegration._availability_cache
+        if cmd in cache:
+            return cache[cmd]
+        with BaseCLIIntegration._availability_cache_lock:
+            if cmd not in cache:
+                cache[cmd] = shutil.which(cmd) is not None
+            return cache[cmd]
     
     @abstractmethod
     async def execute(self, prompt: str, **options) -> str:
@@ -128,6 +150,7 @@ class BaseCLIIntegration(ABC):
             
         Raises:
             TimeoutError: If the command times out
+            CLIExecutionError: If the command fails with non-zero exit code
         """
         timeout = timeout or self.timeout
         
@@ -144,7 +167,12 @@ class BaseCLIIntegration(ABC):
                 proc.communicate(),
                 timeout=timeout
             )
-            return stdout.decode()
+            
+            # Check exit code and raise error if non-zero
+            if proc.returncode != 0:
+                raise CLIExecutionError(cmd, proc.returncode, stderr.decode(errors="replace"))
+            
+            return stdout.decode(errors="replace")
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -183,7 +211,12 @@ class BaseCLIIntegration(ABC):
                 proc.communicate(),
                 timeout=timeout
             )
-            return stdout.decode(), stderr.decode()
+            
+            # Check exit code and raise error if non-zero
+            if proc.returncode != 0:
+                raise CLIExecutionError(cmd, proc.returncode, stderr.decode(errors="replace"))
+            
+            return stdout.decode(errors="replace"), stderr.decode(errors="replace")
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -203,8 +236,12 @@ class BaseCLIIntegration(ABC):
             
         Yields:
             str: Each line of output
+            
+        Raises:
+            CLIExecutionError: If the command fails with non-zero exit code
         """
         timeout = timeout or self.timeout
+        stderr_buffer = []
         
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -215,15 +252,35 @@ class BaseCLIIntegration(ABC):
         )
         
         try:
+            async def read_stderr():
+                """Read stderr into buffer for error reporting"""
+                while True:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    stderr_buffer.append(line.decode(errors="replace").rstrip('\n'))
+            
+            # Start reading stderr in background
+            stderr_task = asyncio.create_task(read_stderr())
+            
             async def read_lines():
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
                         break
-                    yield line.decode().rstrip('\n')
+                    yield line.decode(errors="replace").rstrip('\n')
             
             async for line in read_lines():
                 yield line
+            
+            # Wait for stderr reading to complete and process to finish
+            await stderr_task
+            await proc.wait()
+            
+            # Check exit code and raise error if non-zero
+            if proc.returncode != 0:
+                stderr_text = '\n'.join(stderr_buffer)
+                raise CLIExecutionError(cmd, proc.returncode, stderr_text)
                 
         except asyncio.TimeoutError:
             proc.kill()
@@ -249,19 +306,8 @@ class BaseCLIIntegration(ABC):
         
         def tool_func(query: str) -> str:
             """Execute the CLI tool with the given query."""
-            # Use asyncio.run() for clean event loop management
-            # This creates a new event loop, runs the coroutine, and closes it
-            try:
-                # Check if we're already in an async context
-                asyncio.get_running_loop()
-                # If we're in an async context, use ThreadPoolExecutor to avoid nested loop
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, integration.execute(query))
-                    return future.result()
-            except RuntimeError:
-                # No running loop, safe to use asyncio.run()
-                return asyncio.run(integration.execute(query))
+            from .._async_bridge import run_sync
+            return run_sync(integration.execute(query))
         
         # Set function metadata for agent tool registration
         tool_func.__name__ = f"{self.cli_command}_tool"
@@ -285,19 +331,29 @@ def get_available_integrations() -> Dict[str, bool]:
     """
     Get a dictionary of all integrations and their availability status.
     
+    Backward compatibility wrapper. Use ExternalAgentRegistry for new code.
+    
     Returns:
         dict: Mapping of integration name to availability (True/False)
     """
-    from .claude_code import ClaudeCodeIntegration
-    from .gemini_cli import GeminiCLIIntegration
-    from .codex_cli import CodexCLIIntegration
-    from .cursor_cli import CursorCLIIntegration
+    # Import here to avoid circular imports
+    try:
+        from .registry import get_registry
+        from .._async_bridge import run_sync
+        return run_sync(get_registry().get_available())
     
-    integrations = {
-        'claude': ClaudeCodeIntegration(),
-        'gemini': GeminiCLIIntegration(),
-        'codex': CodexCLIIntegration(),
-        'cursor': CursorCLIIntegration(),
-    }
-    
-    return {name: integration.is_available for name, integration in integrations.items()}
+    except ImportError:
+        # Fallback to original implementation
+        from .claude_code import ClaudeCodeIntegration
+        from .gemini_cli import GeminiCLIIntegration
+        from .codex_cli import CodexCLIIntegration
+        from .cursor_cli import CursorCLIIntegration
+        
+        integrations = {
+            'claude': ClaudeCodeIntegration(),
+            'gemini': GeminiCLIIntegration(),
+            'codex': CodexCLIIntegration(),
+            'cursor': CursorCLIIntegration(),
+        }
+        
+        return {name: integration.is_available for name, integration in integrations.items()}

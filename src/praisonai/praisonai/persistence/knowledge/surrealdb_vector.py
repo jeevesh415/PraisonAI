@@ -8,7 +8,8 @@ Install: pip install surrealdb
 import logging
 from typing import Any, Dict, List, Optional
 
-from .base import KnowledgeStore, KnowledgeDocument
+from .base import KnowledgeStore, KnowledgeDocument, validate_identifier
+from ..._async_bridge import run_sync
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,8 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
         url: str = "ws://localhost:8000/rpc",
         namespace: str = "praisonai",
         database: str = "vectors",
-        username: str = "root",
-        password: str = "root",
+        username: str | None = None,
+        password: str | None = None,
         embedding_dim: int = 1536,
     ):
         """
@@ -43,10 +44,19 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
             url: SurrealDB WebSocket URL
             namespace: SurrealDB namespace
             database: SurrealDB database
-            username: Authentication username
-            password: Authentication password
+            username: Authentication username (required for security)
+            password: Authentication password (required for security)
             embedding_dim: Embedding dimension
+            
+        Raises:
+            ValueError: If username or password is None (default credentials not allowed)
         """
+        if username is None or password is None:
+            raise ValueError(
+                "SurrealDB username and password must be provided explicitly. "
+                "Default credentials are not allowed for security reasons."
+            )
+        
         self.url = url
         self.namespace = namespace
         self.database = database
@@ -79,14 +89,12 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
             await client.use(self.namespace, self.database)
             return client
         
-        loop = asyncio.get_event_loop()
-        self._client = loop.run_until_complete(connect())
+        self._client = run_sync(connect())
         self._initialized = True
     
     def _run_async(self, coro):
         """Run async coroutine synchronously."""
-        import asyncio
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return run_sync(coro)
     
     def create_collection(
         self,
@@ -97,12 +105,20 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     ) -> None:
         """Create a collection (SurrealDB creates tables on insert)."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(name, "collection name")
+        
         # SurrealDB creates tables automatically
         logger.info(f"Collection '{name}' will be created on first insert")
     
     def delete_collection(self, name: str) -> bool:
         """Delete a collection."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(name, "collection name")
+        
         try:
             self._run_async(self._client.query(f"REMOVE TABLE {name}"))
             return True
@@ -113,6 +129,10 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     def collection_exists(self, name: str) -> bool:
         """Check if collection exists."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(name, "collection name")
+        
         try:
             result = self._run_async(self._client.query(f"INFO FOR TABLE {name}"))
             return bool(result)
@@ -139,6 +159,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     ) -> List[str]:
         """Insert documents."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
         
         ids = []
         for doc in documents:
@@ -167,6 +190,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     ) -> List[str]:
         """Upsert documents."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
         
         ids = []
         for doc in documents:
@@ -198,6 +224,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     ) -> List[KnowledgeDocument]:
         """Search for similar documents using vector search."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
         
         # SurrealDB vector search query
         embedding_str = str(query_embedding)
@@ -239,6 +268,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
         ids: List[str]
     ) -> List[KnowledgeDocument]:
         """Get documents by IDs."""
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
+
         self._init_client()
         
         documents = []
@@ -269,6 +301,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
         """Delete documents."""
         self._init_client()
         
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
+        
         count = 0
         if ids:
             for doc_id in ids:
@@ -289,6 +324,9 @@ class SurrealDBVectorKnowledgeStore(KnowledgeStore):
     def count(self, collection: str) -> int:
         """Count documents."""
         self._init_client()
+        
+        # Validate collection name to prevent SQL injection
+        validate_identifier(collection, "collection")
         
         try:
             result = self._run_async(

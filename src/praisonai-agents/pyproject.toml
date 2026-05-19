@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "praisonaiagents"
-version = "1.6.5"
+version = "1.6.42"
 description = "Praison AI agents for completing complex tasks with Self Reflection Agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ dependencies = [
     "rich",
     "openai>=1.68.2",
     "posthog>=3.0.0",
+    "PyYAML>=6.0",
     "aiohttp>=3.8.0"
 ]
 
@@ -29,7 +30,7 @@ mcp = [
 
 memory = [
     "chromadb>=1.0.0",
-    "litellm>=1.81.0,<=1.82.6",
+    "litellm>=1.83.14",
 ]
 
 knowledge = [
@@ -47,7 +48,7 @@ graph = [
 
 # Add LLM dependencies
 llm = [
-    "litellm>=1.81.0,<=1.82.6",
+    "litellm>=1.83.14",
     "pydantic>=2.10.0"
 ]
 
@@ -100,6 +101,16 @@ crawl = [
     "playwright>=1.47.0",
 ]
 
+# Sandbox dependencies
+sandbox = [
+    "e2b-code-interpreter>=1.0.0",
+]
+
+# Docker sandbox dependencies
+sandbox-docker = [
+    "docker>=7.0.0",
+]
+
 # Combined features
 all = [
     "praisonaiagents[memory]",
@@ -111,8 +122,11 @@ all = [
     "praisonaiagents[telemetry]",
     "praisonaiagents[mongodb]",
     "praisonaiagents[auth]",
+    "praisonaiagents[sandbox]",
     "praisonaiagents[search]",
-    "praisonaiagents[crawl]"
+    "praisonaiagents[crawl]",
+    "praisonaiagents[autonomy]",
+    "praisonaiagents[os]"
 ]
 
 [tool.setuptools.packages.find]

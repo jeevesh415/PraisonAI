@@ -6,41 +6,55 @@ import warnings
 import os
 import json
 
-# Suppress Pydantic serialization warnings from LiteLLM BEFORE any imports
-# These warnings occur when LiteLLM's response objects have field mismatches
-# Using both filterwarnings AND patching warnings.warn for complete suppression
+# Warning filter support - now opt-in only (no global mutation at import)
+import atexit
 
-warnings.filterwarnings("ignore", message=".*Pydantic serializer warnings.*")
-warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
-warnings.filterwarnings("ignore", message=".*Expected \\d+ fields but got.*")
-warnings.filterwarnings("ignore", message=".*Expected `StreamingChoices`.*")
-warnings.filterwarnings("ignore", message=".*Expected `Message`.*")
-warnings.filterwarnings("ignore", message=".*serialized value may not be as expected.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
-
-# Patch warnings.showwarning to intercept ALL warnings including those from crewai's patched warn
-# This is the final output function that actually displays warnings
-_SUPPRESSED_PATTERNS = [
+_SUPPRESSED_PATTERNS = (
     "Pydantic serializer warnings",
     "PydanticSerializationUnexpectedValue",
-    "Expected",  # Catches "Expected N fields but got M"
+    "Expected ",  # Narrowed from just "Expected" to avoid false positives
     "StreamingChoices",
     "serialized value may not be as expected",
-    "duckduckgo_search",  # Suppress duckduckgo rename warning
-]
+    "duckduckgo_search",
+)
 
-_original_showwarning = warnings.showwarning
+_installed = False
+_original_showwarning = None
+_original_filters = None
 
-def _patched_showwarning(message, category, filename, lineno, file=None, line=None):
-    msg_str = str(message)
-    for pattern in _SUPPRESSED_PATTERNS:
-        if pattern in msg_str:
-            return
-    if category is UserWarning and "pydantic" in filename.lower():
+def install_warning_filters() -> None:
+    """Install PraisonAI's noise filters. Idempotent. CLI-only."""
+    global _installed, _original_showwarning, _original_filters
+    if _installed:
         return
-    _original_showwarning(message, category, filename, lineno, file, line)
+    _original_showwarning = warnings.showwarning
+    _original_filters = list(warnings.filters)
 
-warnings.showwarning = _patched_showwarning
+    # Install filterwarnings for common patterns
+    for pattern in _SUPPRESSED_PATTERNS:
+        warnings.filterwarnings("ignore", message=f".*{pattern}.*")
+    warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
+
+    def _filtered_showwarning(message, category, filename, lineno, file=None, line=None):
+        msg_str = str(message)
+        if any(pattern in msg_str for pattern in _SUPPRESSED_PATTERNS):
+            return
+        if category is UserWarning and "pydantic" in filename.lower():
+            return
+        _original_showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _filtered_showwarning
+    atexit.register(_uninstall_warning_filters)
+    _installed = True
+
+def _uninstall_warning_filters() -> None:
+    """Restore original warnings behavior on exit."""
+    global _installed, _original_filters, _original_showwarning
+    if _installed and _original_showwarning is not None:
+        warnings.showwarning = _original_showwarning
+        if _original_filters is not None:
+            warnings.filters[:] = _original_filters
+        _installed = False
 
 # Suppress crewai RuntimeWarning about module loading order (only in non-debug mode)
 # This warning is harmless and occurs when running as `python -m praisonai.cli.main`
@@ -56,7 +70,6 @@ import yaml
 import time
 from rich import print
 from dotenv import load_dotenv
-load_dotenv()
 import shutil
 import subprocess
 import logging
@@ -94,6 +107,11 @@ _BLOCKED_ENV_KEYS = frozenset({
 
 # Pre-compute uppercase lookup set once at module load (avoids rebuilding per call)
 _BLOCKED_ENV_KEYS_UPPER = frozenset(k.upper() for k in _BLOCKED_ENV_KEYS)
+
+
+def _load_env_once():
+    """Load environment variables from .env file once at CLI startup."""
+    load_dotenv()
 
 
 def _validate_env_key(key) -> None:
@@ -141,33 +159,12 @@ def _get_agents_generator():
     return AgentsGenerator
 
 # Optional module imports with availability checks
-CHAINLIT_AVAILABLE = False
 GRADIO_AVAILABLE = False
 CALL_MODULE_AVAILABLE = False
 CREWAI_AVAILABLE = False
 AUTOGEN_AVAILABLE = False
 PRAISONAI_AVAILABLE = False
 TRAIN_AVAILABLE = False
-try:
-    import importlib.util
-    CHAINLIT_AVAILABLE = importlib.util.find_spec("chainlit") is not None
-except ImportError:
-    pass
-
-def _get_chainlit_run():
-    """Lazy import chainlit to avoid loading .env at startup"""
-    # Create necessary directories and set CHAINLIT_APP_ROOT
-    if "CHAINLIT_APP_ROOT" not in os.environ:
-        chainlit_root = os.path.join(os.path.expanduser("~"), ".praison")
-        os.environ["CHAINLIT_APP_ROOT"] = chainlit_root
-    else:
-        chainlit_root = os.environ["CHAINLIT_APP_ROOT"]
-        
-    os.makedirs(chainlit_root, exist_ok=True)
-    os.makedirs(os.path.join(chainlit_root, ".files"), exist_ok=True)
-    
-    from chainlit.cli import chainlit_run
-    return chainlit_run
 
 # Use find_spec for fast availability checks (no actual import)
 import importlib.util
@@ -221,7 +218,9 @@ def _get_autogen():
     import autogen
     return autogen
 
-logging.basicConfig(level=os.environ.get('LOGLEVEL', 'WARNING') or 'WARNING', format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure root logging only at CLI entrypoint
+from .._logging import configure_cli_logging
+configure_cli_logging(os.environ.get('LOGLEVEL', 'WARNING') or 'WARNING')
 logging.getLogger('alembic').setLevel(logging.ERROR)
 logging.getLogger('gradio').setLevel(logging.ERROR)
 logging.getLogger('gradio').setLevel(os.environ.get('GRADIO_LOGLEVEL', 'WARNING'))
@@ -267,32 +266,32 @@ class PraisonAI:
         """
         Initialize the PraisonAI object with default parameters.
         """
+        # Initialize telemetry defaults (moved from lazy __getattr__ hook)
+        from praisonai import _ensure_telemetry_defaults
+        _ensure_telemetry_defaults()
         self.agent_yaml = agent_yaml
         self._interactive_mode = False  # Flag for interactive TUI mode
         # Create config_list with AutoGen compatibility
-        # Support multiple environment variable patterns for better compatibility
-        # Priority order: MODEL_NAME > OPENAI_MODEL_NAME for model selection
-        model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-4o-mini")
+        # Resolve LLM endpoint configuration from environment variables
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
         
-        # Priority order for base_url: OPENAI_BASE_URL > OPENAI_API_BASE > OLLAMA_API_BASE
-        # OPENAI_BASE_URL is the standard OpenAI SDK environment variable
-        base_url = (
-            os.environ.get("OPENAI_BASE_URL") or 
-            os.environ.get("OPENAI_API_BASE") or
-            os.environ.get("OLLAMA_API_BASE", "https://api.openai.com/v1")
-        )
-        
-        api_key = os.environ.get("OPENAI_API_KEY")
         self.config_list = [
             {
-                'model': model_name,
-                'base_url': base_url,
-                'api_key': api_key,
+                'model': ep.model,
+                'base_url': ep.base_url,
+                'api_key': ep.api_key,
                 'api_type': 'openai'        # AutoGen expects this field
             }
         ]
         self.agent_file = agent_file
         self.framework = framework
+        
+        # Validate framework availability early to fail fast
+        if self.framework:
+            from praisonai.framework_adapters.validators import assert_framework_available
+            assert_framework_available(self.framework)
+        
         self.auto = auto
         self.init = init
         self.tools = tools or []  # Store tool class names as a list
@@ -350,6 +349,13 @@ class PraisonAI:
         initializes the necessary attributes, and then calls the appropriate methods based on the
         provided arguments.
         """
+        # Load environment variables from .env file
+        _load_env_once()
+        
+        # Warning filters now installed via Typer callback for CLI-only usage
+        
+        # Telemetry defaults now handled in PraisonAI.__init__ with Langfuse awareness
+        
         # Store the original agent_file from constructor
         original_agent_file = self.agent_file
         
@@ -365,6 +371,7 @@ class PraisonAI:
         self.args = args
         invocation_cmd = "praisonai"
         version_string = f"PraisonAI version {__version__}"
+        
 
         # Handle -p/--prompt flag - treat as direct prompt
         if getattr(args, 'prompt_flag', None):
@@ -372,6 +379,11 @@ class PraisonAI:
             args.command = None
 
         self.framework = args.framework or self.framework
+        
+        # Validate framework availability early to fail fast
+        if self.framework:
+            from praisonai.framework_adapters.validators import assert_framework_available
+            assert_framework_available(self.framework)
         
         # Update config_list model if --model flag is provided
         if getattr(args, 'model', None):
@@ -408,6 +420,28 @@ class PraisonAI:
                     exit_code = AgentSchedulerHandler.handle_schedule_command(args, unknown_args, daemon_mode=daemon_mode)
                 
                 sys.exit(exit_code)
+            
+            # Handle backends command
+            elif args.command == "backends":
+                from rich import print
+                subcommand = unknown_args[0] if unknown_args and not unknown_args[0].startswith('-') else None
+                
+                if subcommand == "list" or subcommand is None:
+                    # List registered CLI backends
+                    try:
+                        from praisonai.cli_backends import list_cli_backends
+                        backends = list_cli_backends()
+                        for backend in backends:
+                            print(backend)
+                        return ""
+                    except ImportError:
+                        print("[red]CLI backends not available[/red]")
+                        return None
+                else:
+                    print(f"[red]Unknown backends subcommand: {subcommand}[/red]")
+                    print("Available subcommands: list")
+                    return None
+            
             elif args.command.startswith("tests.test") or args.command.startswith("tests/test"):  # Argument used for testing purposes
                 print("test")
                 return "test"
@@ -572,10 +606,15 @@ class PraisonAI:
             return
 
         # chat and code commands are now terminal-native (handled by Typer commands)
-        # They no longer open Chainlit browser UI
 
         if getattr(args, 'realtime', False):
-            self.create_realtime_interface()
+            try:
+                from praisonai.cli.commands.ui import _launch_aiui_app
+                _launch_aiui_app("ui_realtime", "ui_realtime", 8085, "127.0.0.1", None, False, "Realtime Voice")
+            except ImportError:
+                print("\033[91mERROR: Realtime UI is not installed.\033[0m")
+                print('Install with: pip install "praisonai[ui]"')
+                sys.exit(1)
             return
 
         if getattr(args, 'call', False):
@@ -726,7 +765,10 @@ class PraisonAI:
             if args.ui == "gradio":
                 self.create_gradio_interface()
             elif args.ui == "chainlit":
-                self.create_chainlit_interface()
+                # Deprecation warning and route to new aiui agents interface
+                print("\n\033[93mWARNING: --ui chainlit is deprecated and will be removed in a future release.\033[0m")
+                print("Launching the new aiui-based agents interface instead...")
+                self.create_aiui_agents_interface()
             else:
                 # Modify code to allow default UI
                 AgentsGenerator = _get_agents_generator()
@@ -750,7 +792,8 @@ class PraisonAI:
                 n8n_handler = N8nHandler(
                     verbose=getattr(args, 'verbose', False),
                     n8n_url=getattr(args, 'n8n_url', 'http://localhost:5678'),
-                    api_url=getattr(args, 'api_url', 'http://127.0.0.1:8005')
+                    api_url=getattr(args, 'api_url', None),
+                    port=getattr(args, 'port', 8005)
                 )
                 result = n8n_handler.execute(self.agent_file)
                 return result
@@ -881,7 +924,7 @@ class PraisonAI:
             return default_args
         
         # Define special commands
-        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed', 'flow', 'dashboard']
+        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed', 'flow', 'dashboard', 'backends']
         
         parser = argparse.ArgumentParser(prog="praisonai", description="praisonAI command-line interface")
         parser.add_argument("--framework", choices=["crewai", "autogen", "praisonai"], help="Specify the framework")
@@ -1022,7 +1065,7 @@ class PraisonAI:
         # n8n Integration - export workflow to n8n
         parser.add_argument("--n8n", action="store_true", help="Export workflow to n8n and open in browser")
         parser.add_argument("--n8n-url", type=str, default="http://localhost:5678", help="n8n instance URL (default: http://localhost:5678)")
-        parser.add_argument("--api-url", type=str, default="http://127.0.0.1:8005", help="PraisonAI API URL for n8n to call (default: http://127.0.0.1:8005)")
+        parser.add_argument("--api-url", type=str, help="PraisonAI API URL for n8n to call (default: auto-detected; for Docker Desktop on macOS/Windows with N8N_DOCKER=1 use http://host.docker.internal:8005)")
         
         # Serve - start API server for agents
         parser.add_argument("--serve", action="store_true", help="Start API server for agents (use with agents.yaml)")
@@ -1063,9 +1106,25 @@ class PraisonAI:
         # Sandbox Execution - secure command execution
         parser.add_argument("--sandbox", type=str, choices=["off", "basic", "strict"], help="Enable sandboxed command execution")
         
-        # External Agent - use external AI CLI tools
-        parser.add_argument("--external-agent", type=str, choices=["claude", "gemini", "codex", "cursor"],
+        # Backend group - mutually exclusive external agent and CLI backend options
+        backend_group = parser.add_mutually_exclusive_group()
+        backend_group.add_argument("--external-agent", type=str, choices=["claude", "gemini", "codex", "cursor"],
                           help="Use external AI CLI tool (claude, gemini, codex, cursor)")
+        
+        # CLI Backend - delegate agent turns to CLI backend
+        # Dynamically populate choices from registered backends
+        try:
+            from praisonai.cli_backends import list_cli_backends
+            cli_backend_choices = list_cli_backends() or None
+        except ImportError:
+            cli_backend_choices = None
+        
+        backend_group.add_argument("--cli-backend", type=str, choices=cli_backend_choices,
+                          help="Delegate agent turns to a CLI backend (see praisonai backends list)")
+        
+        # External agent direct mode (not mutually exclusive with backend choice)
+        parser.add_argument("--external-agent-direct", action="store_true",
+                          help="Use external agent as direct proxy (skip manager Agent delegation)")
         
         # Compare - compare different CLI modes
         parser.add_argument("--compare", type=str, help="Compare CLI modes (comma-separated: basic,tools,research,planning)")
@@ -1136,7 +1195,7 @@ class PraisonAI:
             # UI command — routes to Typer CLI for clean chat UI (praisonaiui)
             pass
         # chat and code commands are now terminal-native (handled by Typer commands)
-        # They no longer set args.ui = 'chainlit' or open browser
+        # Legacy --ui handling is preserved via the deprecation path above
         
         # Handle --claudecode flag for code command
         if getattr(args, 'claudecode', False):
@@ -1226,11 +1285,13 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'realtime':
-                if not CHAINLIT_AVAILABLE:
-                    print("[red]ERROR: Realtime UI is not installed. Install with:[/red]")
-                    print("\npip install \"praisonai[realtime]\"\n")
+                try:
+                    from praisonai.cli.commands.ui import _launch_aiui_app
+                    _launch_aiui_app("ui_realtime", "ui_realtime", 8085, "127.0.0.1", None, False, "Realtime Voice")
+                except ImportError:
+                    print("\033[91mERROR: Realtime UI is not installed.\033[0m")
+                    print('Install with: pip install "praisonai[ui]"')
                     sys.exit(1)
-                self.create_realtime_interface()
                 sys.exit(0)
 
             elif args.command == 'train':
@@ -1887,16 +1948,16 @@ class PraisonAI:
                     # Load from file
                     try:
                         import inspect
-                        import importlib.util
-                        spec = importlib.util.spec_from_file_location("rewrite_tools_module", rewrite_tools)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(rewrite_tools, name="rewrite_tools_module")
+                        if module is not None:
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     rewrite_tools_list.append(obj)
                             if rewrite_tools_list:
                                 print(f"[cyan]Loaded {len(rewrite_tools_list)} tools for query rewriter[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Rewrite tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load rewrite tools: {e}[/yellow]")
                 else:
@@ -1979,16 +2040,16 @@ class PraisonAI:
                     # Load from file
                     try:
                         import inspect
-                        import importlib.util
-                        spec = importlib.util.spec_from_file_location("expand_tools_module", expand_tools)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(expand_tools, name="expand_tools_module")
+                        if module is not None:
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     expand_tools_list.append(obj)
                             if expand_tools_list:
                                 print(f"[cyan]Loaded {len(expand_tools_list)} tools for prompt expander[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Expand tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load expand tools: {e}[/yellow]")
                 else:
@@ -2064,15 +2125,16 @@ class PraisonAI:
             # Load from file
             try:
                 import inspect
-                spec = importlib.util.spec_from_file_location("tools_module", tools_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
+                from .._safe_loader import load_user_module
+                module = load_user_module(tools_path, name="tools_module")
+                if module is not None:
                     for name, obj in inspect.getmembers(module):
                         if inspect.isfunction(obj) and not name.startswith('_'):
                             tools_list.append(obj)
                     if tools_list:
                         print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
+                else:
+                    print(f"[yellow]Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
             except Exception as e:
                 print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
         else:
@@ -2700,14 +2762,16 @@ class PraisonAI:
             
             if tools_file.exists():
                 try:
-                    spec = importlib.util.spec_from_file_location("recipe_tools", str(tools_file))
-                    tools_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(tools_module)
-                    
-                    # Build registry from public callable functions
-                    for name, obj in vars(tools_module).items():
-                        if callable(obj) and not name.startswith('_'):
-                            tool_registry[name] = obj
+                    from .._safe_loader import load_user_module
+                    tools_module = load_user_module(str(tools_file), name="recipe_tools")
+                    if tools_module is not None:
+                        import inspect
+                        # Build registry from public functions only
+                        for name, obj in vars(tools_module).items():
+                            if inspect.isfunction(obj) and not name.startswith('_') and inspect.getmodule(obj) is tools_module:
+                                tool_registry[name] = obj
+                    else:
+                        logging.getLogger(__name__).warning("Recipe tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")
                     
                     if tool_registry:
                         print(f"[cyan]Loaded {len(tool_registry)} tools from tools.py: {', '.join(tool_registry.keys())}[/cyan]")
@@ -4001,6 +4065,31 @@ Do NOT add any explanations or formatting."""
         
         return results[-1].get("output", "") if results else ""
 
+    def _execute_agent_with_budget_handling(self, agent, method_name, *args, **kwargs):
+        """Run ``agent.<method_name>(*args, **kwargs)`` with a graceful
+        BudgetExceededError handler.
+
+        Wrapper-only fix (no core SDK changes). Users configure budgets via
+        ``execution=ExecutionConfig(max_budget=...)`` on the Agent — per
+        AGENTS.md §5.3 there is NO top-level ``max_budget=`` parameter on
+        Agent.__init__ (avoids parameter bloat).
+
+        When the budget is hit this prints a single-line actionable error
+        message and exits with code 1 instead of leaking a raw traceback.
+        Any other exception is re-raised unchanged.
+        """
+        from praisonaiagents.errors import BudgetExceededError
+        try:
+            return getattr(agent, method_name)(*args, **kwargs)
+        except BudgetExceededError as e:
+            from rich import print as rich_print
+            rich_print(
+                f"[red]Budget limit exceeded: {e!s}. "
+                "Hint: set budget via "
+                "execution=ExecutionConfig(max_budget=1.00) on your Agent.[/red]"
+            )
+            sys.exit(1)
+
     def _extract_cli_config_for_yaml(self):
         """
         Extract CLI configuration that should be passed to YAML processing.
@@ -4364,11 +4453,13 @@ Do NOT add any explanations or formatting."""
                             existing_tools = list(mcp_tools)
                         agent_config['tools'] = existing_tools
                 
-                # External Agent - Use external AI CLI tools directly
+                # External Agent - Use external AI CLI tools with manager delegation
                 if getattr(self.args, 'external_agent', None):
                     from rich.console import Console
                     ext_console = Console()
                     external_agent_name = self.args.external_agent
+                    direct = getattr(self.args, 'external_agent_direct', False)
+                    
                     try:
                         from .features.external_agents import ExternalAgentsHandler
                         handler = ExternalAgentsHandler(verbose=getattr(self.args, 'verbose', False))
@@ -4378,23 +4469,43 @@ Do NOT add any explanations or formatting."""
                         
                         integration = handler.get_integration(external_agent_name, workspace=workspace)
                         
-                        if integration.is_available:
-                            ext_console.print(f"[bold cyan]🔌 Using external agent: {external_agent_name}[/bold cyan]")
-                            
-                            # Run the external agent directly instead of PraisonAI agent
+                        if not integration.is_available:
+                            ext_console.print(f"[yellow]⚠️ External agent '{external_agent_name}' is not installed[/yellow]")
+                            ext_console.print(f"[dim]Install with: {handler._get_install_instructions(external_agent_name)}[/dim]")
+                            return None
+                        
+                        if direct:
+                            # Pass-through proxy (original behavior, preserved as escape hatch)
+                            ext_console.print(f"[bold cyan]🔌 Using external agent (direct): {external_agent_name}[/bold cyan]")
                             import asyncio
                             try:
                                 result = asyncio.run(integration.execute(prompt))
                                 ext_console.print(f"\n[bold green]Result from {external_agent_name}:[/bold green]")
                                 ext_console.print(result)
-                                # Return empty string to avoid duplicate printing by caller
                                 return ""
                             except Exception as e:
-                                ext_console.print(f"[red]Error executing {external_agent_name}: {e}[/red]")
+                                ext_console.print(f"[red]Error executing {external_agent_name}: {e.__class__.__name__}: {e}[/red]")
                                 return None
-                        else:
-                            ext_console.print(f"[yellow]⚠️ External agent '{external_agent_name}' is not installed[/yellow]")
-                            ext_console.print(f"[dim]Install with: {handler._get_install_instructions(external_agent_name)}[/dim]")
+                        
+                        # NEW default: manager Agent uses external CLI as subagent tool
+                        ext_console.print(f"[bold cyan]🔌 Using external agent via manager delegation: {external_agent_name}[/bold cyan]")
+                        try:
+                            from praisonaiagents import Agent
+                            manager = Agent(
+                                name="Manager",
+                                instructions=(
+                                    f"You are a manager that delegates tasks to the {external_agent_name} subagent "
+                                    f"via the {integration.cli_command}_tool. Call the tool for coding/analysis tasks."
+                                ),
+                                tools=[integration.as_tool()],
+                                llm=agent_config.get('llm') or os.environ.get("MODEL_NAME", "gpt-4o-mini"),
+                            )
+                            result = manager.start(prompt)
+                            ext_console.print(f"\n[bold green]Manager delegation result:[/bold green]")
+                            ext_console.print(result)
+                            return ""
+                        except Exception as e:
+                            ext_console.print(f"[red]Error with manager delegation: {e.__class__.__name__}: {e}[/red]")
                             return None
                     except Exception as e:
                         ext_console.print(f"[red]Error setting up external agent: {e}[/red]")
@@ -4487,6 +4598,14 @@ Do NOT add any explanations or formatting."""
                 
                 return result
             
+            # CLI Backend - delegate agent turns to external CLI tools
+            if hasattr(self, 'args') and getattr(self.args, 'cli_backend', None):
+                try:
+                    from praisonai.cli_backends import resolve_cli_backend
+                    agent_config["cli_backend"] = resolve_cli_backend(self.args.cli_backend)
+                except Exception as e:
+                    self.logger.warning(f"Failed to resolve CLI backend '{self.args.cli_backend}': {e}")
+            
             # Flow Display - Visual workflow tracking
             if hasattr(self, 'args') and getattr(self.args, 'flow_display', False):
                 from .features.flow_display import FlowDisplayHandler
@@ -4517,9 +4636,9 @@ Do NOT add any explanations or formatting."""
                     from rich.panel import Panel
                     
                     with Live(Panel(Spinner("dots", text="Generating..."), border_style="cyan"), refresh_per_second=10, transient=True):
-                        result = auto_rag.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(auto_rag, 'chat', prompt)
                 else:
-                    result = auto_rag.chat(prompt)
+                    result = self._execute_agent_with_budget_handling(auto_rag, 'chat', prompt)
             else:
                 # Resolve display mode from CLI flags
                 display_mode = self._resolve_display_mode()
@@ -4527,16 +4646,16 @@ Do NOT add any explanations or formatting."""
                 if display_mode == 'silent':
                     # -qq: No output at all, exit code only
                     if hasattr(agent, 'start'):
-                        result = agent.start(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                     else:
-                        result = agent.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                 
                 elif display_mode == 'quiet':
                     # -q: Result only, no spinners or status
                     if hasattr(agent, 'start'):
-                        result = agent.start(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                     else:
-                        result = agent.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                     if result is not None:
                         output = getattr(result, 'output', None) or (str(result) if result else None)
                         if output:
@@ -4548,15 +4667,15 @@ Do NOT add any explanations or formatting."""
                         from praisonaiagents.output.status import enable_status_output, disable_status_output
                         enable_status_output(show_timestamps=True, show_metrics=True)
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                         disable_status_output()
                     except ImportError:
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                 
                 elif display_mode == 'debug':
                     # -vv: SDK TraceOutput with markdown rendering
@@ -4564,15 +4683,15 @@ Do NOT add any explanations or formatting."""
                         from praisonaiagents.output.trace import enable_trace_output, disable_trace_output
                         enable_trace_output(use_markdown=True)
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                         disable_trace_output()
                     except ImportError:
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                 
                 elif display_mode == 'jsonl':
                     # --output jsonl: JSONL structured output for CI/CD
@@ -4594,9 +4713,9 @@ Do NOT add any explanations or formatting."""
                     
                     start_time = time.time()
                     if hasattr(agent, 'start'):
-                        result = agent.start(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                     else:
-                        result = agent.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                     
                     # Emit final result
                     reason = getattr(result, 'completion_reason', None) if hasattr(result, 'completion_reason') else 'complete'
@@ -4615,9 +4734,9 @@ Do NOT add any explanations or formatting."""
                     import json as json_mod
                     start_time = time.time()
                     if hasattr(agent, 'start'):
-                        result = agent.start(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                     else:
-                        result = agent.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                     
                     output = result.output if hasattr(result, 'output') else str(result)
                     envelope = {
@@ -4638,15 +4757,15 @@ Do NOT add any explanations or formatting."""
                         flow = track_workflow()
                         flow.start()
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                         flow.stop()
                     except ImportError:
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                 
                 elif display_mode == 'editor':
                     # --output editor: User-friendly step-by-step format
@@ -4656,9 +4775,9 @@ Do NOT add any explanations or formatting."""
                     
                     # Run agent
                     if hasattr(agent, 'start'):
-                        result = agent.start(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                     else:
-                        result = agent.chat(prompt)
+                        result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                     
                     # SDK callbacks (interaction, llm_content) handle display —
                     # no explicit editor.output() needed here.
@@ -4680,15 +4799,15 @@ Do NOT add any explanations or formatting."""
                         from praisonaiagents.output.status import enable_status_output, disable_status_output
                         enable_status_output(show_timestamps=False, show_metrics=False)
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
                         disable_status_output()
                     except ImportError:
                         if hasattr(agent, 'start'):
-                            result = agent.start(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'start', prompt)
                         else:
-                            result = agent.chat(prompt)
+                            result = self._execute_agent_with_budget_handling(agent, 'chat', prompt)
             
             # ===== POST-PROCESSING WITH NEW FEATURES =====
             
@@ -5155,45 +5274,6 @@ Now, {final_instruction.lower()}:"""
         except KeyboardInterrupt:
             print("\n👋 Server stopped.")
 
-    def create_chainlit_chat_interface(self):
-        """
-        Create a Chainlit interface for the chat application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8084"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            chat_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'chat.py')
-            _get_chainlit_run()([chat_ui_path])
-        else:
-            print("ERROR: Chat UI is not installed. Please install it with 'pip install \"praisonai[chat]\"' to use the chat UI.")
-
-    def create_code_interface(self):
-        """
-        Create a Chainlit interface for the code application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8086"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            public_folder = os.path.join(os.path.dirname(__file__), 'public')
-            if not os.path.exists(os.path.join(root_path, "public")):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, os.path.join(root_path, "public"), dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            code_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'code.py')
-            _get_chainlit_run()([code_ui_path])
-        else:
-            print("ERROR: Code UI is not installed. Please install it with 'pip install \"praisonai[code]\"' to use the code UI.")
-
     def create_gradio_interface(self):
         """
         Create a Gradio interface for generating agents and performing tasks.
@@ -5226,50 +5306,26 @@ Now, {final_instruction.lower()}:"""
         else:
             print("ERROR: Gradio is not installed. Please install it with 'pip install gradio' to use this feature.")
 
-    def create_chainlit_interface(self):
+    def create_aiui_agents_interface(self):
         """
-        Create a Chainlit interface for generating agents and performing tasks.
+        Create an aiui-based agents interface (replaces Chainlit).
+        
+        Routes to the new `praisonai ui agents` subcommand.
         """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8082"
-            public_folder = os.path.join(os.path.dirname(praisonai.__file__), 'public')
-            if not os.path.exists("public"):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, 'public', dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            chainlit_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'agents.py')
-            _get_chainlit_run()([chainlit_ui_path])
-        else:
-            print("ERROR: Chainlit is not installed. Please install it with 'pip install \"praisonai[ui]\"' to use the UI.")
-
-    def create_realtime_interface(self):
-        """
-        Create a Chainlit interface for the realtime voice interaction application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8088"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            public_folder = os.path.join(os.path.dirname(praisonai.__file__), 'public')
-            if not os.path.exists(os.path.join(root_path, "public")):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, os.path.join(root_path, "public"), dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            realtime_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'realtime.py')
-            _get_chainlit_run()([realtime_ui_path])
-        else:
-            print("ERROR: Realtime UI is not installed. Please install it with 'pip install \"praisonai[realtime]\"' to use the realtime UI.")
+        try:
+            from praisonai.cli.commands.ui import _launch_aiui_app
+            print("🤖 Launching PraisonAI Agents Dashboard (aiui)...")
+            _launch_aiui_app(
+                app_dir="ui_agents",
+                default_app_name="ui_agents",
+                port=8082,  # Use same port as old Chainlit agents
+                host="127.0.0.1",
+                app_file=None,
+                reload=False,
+                ui_name="Agents Dashboard"
+            )
+        except ImportError:
+            print("ERROR: PraisonAI UI (aiui) is not installed. Please install it with 'pip install \"praisonai[ui]\"' to use the agents dashboard.")
 
     def handle_context_command(self, url: str, goal: str, auto_analyze: bool = False) -> str:
         """
@@ -5362,16 +5418,17 @@ Now, {final_instruction.lower()}:"""
                     # Load from file
                     try:
                         import inspect
-                        spec = importlib.util.spec_from_file_location("tools_module", tools_path)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(tools_path, name="tools_module")
+                        if module is not None:
                             # Get all callable functions from the module
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     tools_list.append(obj)
                             if tools_list:
                                 print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
                 else:
@@ -6776,5 +6833,7 @@ Provide a concise summary (max 200 words):"""
                 logging.getLogger(logger_name).setLevel(level)
 
 if __name__ == "__main__":
+    # Install warning filters when run as script
+    install_warning_filters()
     praison_ai = PraisonAI()
     praison_ai.main()

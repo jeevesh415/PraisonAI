@@ -11,7 +11,8 @@ import logging
 import time
 from typing import List, Optional
 
-from .base import ConversationStore, ConversationSession, ConversationMessage
+from .base import ConversationStore, ConversationSession, ConversationMessage, validate_identifier
+from ..._async_bridge import run_sync
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     def __init__(
         self,
         path: str = "praisonai_conversations.db",
-        table_prefix: str = "praisonai_",
+        table_prefix: str = "praison_",
     ):
         """
         Initialize async SQLite store.
@@ -40,6 +41,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
             table_prefix: Prefix for table names
         """
         self.path = path
+        validate_identifier(table_prefix, "table_prefix")
         self.table_prefix = table_prefix
         self._conn = None
         self._initialized = False
@@ -74,6 +76,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
                 user_id TEXT,
                 agent_id TEXT,
                 name TEXT,
+                state TEXT,
                 metadata TEXT,
                 created_at REAL,
                 updated_at REAL
@@ -86,6 +89,8 @@ class AsyncSQLiteConversationStore(ConversationStore):
                 session_id TEXT REFERENCES {sessions_table}(session_id) ON DELETE CASCADE,
                 role TEXT,
                 content TEXT,
+                tool_calls TEXT,
+                tool_call_id TEXT,
                 metadata TEXT,
                 created_at REAL
             )
@@ -105,9 +110,10 @@ class AsyncSQLiteConversationStore(ConversationStore):
         
         table = f"{self.table_prefix}sessions"
         await self._conn.execute(f"""
-            INSERT INTO {table} (session_id, user_id, agent_id, name, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO {table} (session_id, user_id, agent_id, name, state, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (session.session_id, session.user_id, session.agent_id, session.name,
+              json.dumps(session.state) if session.state else None,
               json.dumps(session.metadata) if session.metadata else None,
               session.created_at, session.updated_at))
         await self._conn.commit()
@@ -116,7 +122,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def create_session(self, session: ConversationSession) -> ConversationSession:
         """Sync wrapper for create_session."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_create_session(session)
         )
     
@@ -137,6 +143,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
                 user_id=row['user_id'],
                 agent_id=row['agent_id'],
                 name=row['name'],
+                state=json.loads(row['state']) if row['state'] else None,
                 metadata=json.loads(row['metadata']) if row['metadata'] else None,
                 created_at=row['created_at'],
                 updated_at=row['updated_at']
@@ -145,7 +152,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def get_session(self, session_id: str) -> Optional[ConversationSession]:
         """Sync wrapper for get_session."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_get_session(session_id)
         )
     
@@ -159,9 +166,11 @@ class AsyncSQLiteConversationStore(ConversationStore):
         
         await self._conn.execute(f"""
             UPDATE {table} 
-            SET name = ?, metadata = ?, updated_at = ?
+            SET name = ?, state = ?, metadata = ?, updated_at = ?
             WHERE session_id = ?
-        """, (session.name, json.dumps(session.metadata) if session.metadata else None,
+        """, (session.name,
+              json.dumps(session.state) if session.state else None,
+              json.dumps(session.metadata) if session.metadata else None,
               session.updated_at, session.session_id))
         await self._conn.commit()
         
@@ -169,7 +178,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def update_session(self, session: ConversationSession) -> ConversationSession:
         """Sync wrapper for update_session."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_update_session(session)
         )
     
@@ -188,7 +197,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def delete_session(self, session_id: str) -> bool:
         """Sync wrapper for delete_session."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_delete_session(session_id)
         )
     
@@ -231,6 +240,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
                 user_id=row['user_id'],
                 agent_id=row['agent_id'],
                 name=row['name'],
+                state=json.loads(row['state']) if row['state'] else None,
                 metadata=json.loads(row['metadata']) if row['metadata'] else None,
                 created_at=row['created_at'],
                 updated_at=row['updated_at']
@@ -246,7 +256,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
         offset: int = 0
     ) -> List[ConversationSession]:
         """Sync wrapper for list_sessions."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_list_sessions(user_id, agent_id, limit, offset)
         )
     
@@ -259,9 +269,11 @@ class AsyncSQLiteConversationStore(ConversationStore):
         table = f"{self.table_prefix}messages"
         
         await self._conn.execute(f"""
-            INSERT INTO {table} (id, session_id, role, content, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO {table} (id, session_id, role, content, tool_calls, tool_call_id, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (message.id, session_id, message.role, message.content,
+              json.dumps(message.tool_calls) if message.tool_calls else None,
+              message.tool_call_id,
               json.dumps(message.metadata) if message.metadata else None,
               message.created_at))
         await self._conn.commit()
@@ -270,7 +282,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def add_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         """Sync wrapper for add_message."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_add_message(session_id, message)
         )
     
@@ -314,6 +326,8 @@ class AsyncSQLiteConversationStore(ConversationStore):
                 session_id=row['session_id'],
                 role=row['role'],
                 content=row['content'],
+                tool_calls=json.loads(row['tool_calls']) if row['tool_calls'] else None,
+                tool_call_id=row['tool_call_id'],
                 metadata=json.loads(row['metadata']) if row['metadata'] else None,
                 created_at=row['created_at']
             )
@@ -328,7 +342,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
         after: Optional[float] = None
     ) -> List[ConversationMessage]:
         """Sync wrapper for get_messages."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_get_messages(session_id, limit, before, after)
         )
     
@@ -354,7 +368,7 @@ class AsyncSQLiteConversationStore(ConversationStore):
     
     def delete_messages(self, session_id: str, message_ids: Optional[List[str]] = None) -> int:
         """Sync wrapper for delete_messages."""
-        return asyncio.get_event_loop().run_until_complete(
+        return run_sync(
             self.async_delete_messages(session_id, message_ids)
         )
     
@@ -368,4 +382,4 @@ class AsyncSQLiteConversationStore(ConversationStore):
     def close(self) -> None:
         """Sync wrapper for close."""
         if self._conn:
-            asyncio.get_event_loop().run_until_complete(self.async_close())
+            run_sync(self.async_close())

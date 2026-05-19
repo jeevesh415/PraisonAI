@@ -8,7 +8,7 @@ for maintainability.
 
 import os
 import logging
-from praisonaiagents._logging import get_logger
+from typing import Optional
 
 # Fallback helpers to avoid circular imports
 def _get_console():
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 import contextlib
-from typing import List, Optional, Any, Dict, Generator, TYPE_CHECKING
+from typing import Optional, Dict, Generator, TYPE_CHECKING
 from collections import OrderedDict
 
 if TYPE_CHECKING:
@@ -81,7 +81,7 @@ class MemoryMixin:
         with self._history_lock:
             self.chat_history.append({"role": role, "content": content})
 
-    def _add_to_chat_history_if_not_duplicate(self, role, content):
+    def _add_to_chat_history_if_not_duplicate(self, role, content) -> bool:
         """Thread-safe method to add messages to chat history only if not duplicate.
         
         Atomically checks for duplicate and adds message under the same lock to prevent TOCTOU races.
@@ -519,6 +519,37 @@ class MemoryMixin:
                 )
         except Exception as e:
             logging.debug(f"Auto-learning extraction failed: {e}")
+
+    def _maybe_emit_nudge(self, user_message: str) -> Optional[str]:
+        """Return a system note to append to the next user turn, or None.
+        
+        Implements the nudge mechanism for self-improving agents.
+        When nudge_interval > 0, this increments a turn counter and emits
+        a nudge prompt every N turns to encourage knowledge persistence.
+        """
+        if not self._learn_config or self._learn_config.nudge_interval <= 0:
+            return None
+            
+        # Initialize/increment turn counter
+        self._turns_since_nudge = getattr(self, "_turns_since_nudge", 0) + 1
+        
+        if self._turns_since_nudge < self._learn_config.nudge_interval:
+            return None
+            
+        # Reset counter and emit nudge
+        self._turns_since_nudge = 0
+        
+        # Optional: only nudge if agent has done meaningful work
+        min_iters = getattr(self._learn_config, 'nudge_min_tool_iters', 3)
+        tool_calls_count = getattr(self, '_recent_tool_calls_count', 0)
+        if tool_calls_count < min_iters:
+            return None
+            
+        return (
+            "\n\n[System nudge] Review the recent conversation. If you discovered a "
+            "non-trivial procedure or pattern, consider using available tools to "
+            "persist this knowledge for future use. Skip if nothing noteworthy."
+        )
 
     def _auto_save_session(self):
         """Auto-save session if auto_save is enabled.

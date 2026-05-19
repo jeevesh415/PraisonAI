@@ -1,16 +1,4 @@
-# Suppress crewai.cli.config logger BEFORE any imports to prevent INFO log
-import logging
-logging.getLogger('crewai.cli.config').setLevel(logging.ERROR)
-
-# Disable OpenTelemetry SDK only when Langfuse is NOT configured
-# (Langfuse v4 requires OTel internally for tracing)
-import os
-_langfuse_configured = bool(os.getenv("LANGFUSE_PUBLIC_KEY") or os.path.exists(
-    os.path.expanduser("~/.praisonai/langfuse.env")
-))
-if not _langfuse_configured:
-    os.environ.setdefault("OTEL_SDK_DISABLED", "true")
-os.environ["EC_TELEMETRY"] = "false"
+import threading
 
 # Version is lightweight, import directly
 from .version import __version__
@@ -25,6 +13,7 @@ __all__ = [
     'CloudProvider',
     'AgentOS',  # Production deployment platform (v0.14.16+)
     'AgentApp',  # Silent alias for AgentOS (backward compat)
+    'Agent',  # Wrapper Agent with CLI backend string resolution
     'recipe',
     'embed',
     'embedding',
@@ -32,17 +21,83 @@ __all__ = [
     'ManagedAgent',
     'ManagedConfig',
     'AnthropicManagedAgent',
-    'LocalManagedAgent',
-    'LocalManagedConfig',
+    'LocalManagedAgent',          # backward compat alias
+    'LocalManagedConfig',         # backward compat alias
+    'SandboxedAgent',             # new honest name
+    'SandboxedAgentConfig',       # new honest name
+    # New canonical agent backends
+    'HostedAgent',
+    'HostedAgentConfig', 
+    'LocalAgent',
+    'LocalAgentConfig',
 ]
+
+# Telemetry initialization state - thread-safe (threading imported above)
+_telemetry_lock = threading.Lock()
+_telemetry_initialized = False
+
+def _get_telemetry_defaults() -> dict[str, str]:
+    """Get telemetry environment defaults without mutating os.environ.
+    
+    Returns:
+        Dict of environment variable defaults for telemetry
+    """
+    import os
+    defaults = {}
+    
+    # Respect any value the user already set
+    if "OTEL_SDK_DISABLED" not in os.environ:
+        langfuse_configured = bool(
+            os.getenv("LANGFUSE_PUBLIC_KEY")
+            or os.path.exists(os.path.expanduser("~/.praisonai/langfuse.env"))
+        )
+        defaults["OTEL_SDK_DISABLED"] = "false" if langfuse_configured else "true"
+    
+    if "EC_TELEMETRY" not in os.environ:
+        defaults["EC_TELEMETRY"] = "false"
+    
+    return defaults
+
+
+def _ensure_telemetry_defaults() -> None:
+    """Apply telemetry env defaults exactly once, on first observability use.
+    
+    Thread-safe implementation using double-checked locking pattern.
+    DEPRECATED: Use _apply_telemetry_defaults() with explicit config instead.
+    """
+    global _telemetry_initialized
+    if _telemetry_initialized:  # fast path, OK without lock
+        return
+    with _telemetry_lock:
+        if _telemetry_initialized:
+            return
+        _apply_telemetry_defaults(_get_telemetry_defaults())
+        _telemetry_initialized = True
+
+
+def _apply_telemetry_defaults(env_vars: dict[str, str]) -> None:
+    """Apply telemetry defaults to os.environ.
+    
+    Args:
+        env_vars: Dict of environment variables to set
+    """
+    import os
+    for key, value in env_vars.items():
+        os.environ.setdefault(key, value)
 
 
 # Lazy loading for heavy imports
 def __getattr__(name):
     """Lazy load heavy modules to improve import time."""
+    # Note: Telemetry initialization moved out of lazy hook to avoid side effects
+    # It should be called explicitly from cli.PraisonAI.__init__ instead
+
     if name == 'PraisonAI':
         from .cli import PraisonAI
         return PraisonAI
+    elif name == 'Agent':
+        from .agent import Agent
+        return Agent
     elif name == 'Deploy':
         from .deploy import Deploy
         return Deploy
@@ -94,12 +149,33 @@ def __getattr__(name):
     elif name == 'LocalManagedConfig':
         from .integrations.managed_local import LocalManagedConfig
         return LocalManagedConfig
+    elif name == 'SandboxedAgent':
+        from .integrations.sandboxed_agent import SandboxedAgent
+        return SandboxedAgent
+    elif name == 'SandboxedAgentConfig':
+        from .integrations.sandboxed_agent import SandboxedAgentConfig
+        return SandboxedAgentConfig
     elif name in ('ManagedConfig', 'ManagedBackendConfig'):
         from .integrations.managed_agents import ManagedConfig
         return ManagedConfig
+    # New canonical agent backends
+    elif name == 'HostedAgent':
+        from .integrations.hosted_agent import HostedAgent
+        return HostedAgent
+    elif name == 'HostedAgentConfig':
+        from .integrations.hosted_agent import HostedAgentConfig
+        return HostedAgentConfig
+    elif name == 'LocalAgent':
+        from .integrations.local_agent import LocalAgent
+        return LocalAgent
+    elif name == 'LocalAgentConfig':
+        from .integrations.local_agent import LocalAgentConfig
+        return LocalAgentConfig
     elif name in ('DB', 'PraisonAIDB', 'PraisonDB'):
         from .db.adapter import DB
         return DB
+    # Note: n8n is available via direct import: from praisonai.n8n import YAMLToN8nConverter
+    # Lazy loading from main package causes recursion, so use direct import for now
     
     # Try praisonaiagents exports
     try:

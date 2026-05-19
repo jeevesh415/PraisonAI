@@ -10,7 +10,6 @@ This is an internal module — end users import the concrete classes.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Set
 
@@ -95,12 +94,15 @@ async def classify_with_llm(
     )
 
     try:
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
+        
         client = OpenAI(
-            api_key=_os.environ.get("OPENAI_API_KEY", ""),
-            base_url=_os.environ.get("OPENAI_BASE_URL"),
+            api_key=ep.api_key or "",
+            base_url=ep.base_url,
         )
         response = client.chat.completions.create(
-            model=_os.environ.get("APPROVAL_LLM_MODEL", "gpt-4o-mini"),
+            model=_os.environ.get("APPROVAL_LLM_MODEL", ep.model),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -125,15 +127,5 @@ async def classify_with_llm(
 
 def sync_wrapper(async_fn, timeout: float):
     """Run *async_fn* (a coroutine) synchronously, handling nested loops."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, async_fn)
-            return future.result(timeout=timeout + 10)
-    else:
-        return asyncio.run(async_fn)
+    from .._async_bridge import run_sync
+    return run_sync(async_fn, timeout=timeout)

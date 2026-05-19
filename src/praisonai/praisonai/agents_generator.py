@@ -6,7 +6,6 @@ import yaml, os
 from rich import print
 from dotenv import load_dotenv
 from .auto import AutoGenerator
-from .inbuilt_tools import *
 from .inc import PraisonAIModel
 import inspect
 from pathlib import Path
@@ -16,80 +15,40 @@ import os
 import logging
 import re
 import keyword
+import difflib
 
-# Framework-specific imports with availability checks
-CREWAI_AVAILABLE = False
-AUTOGEN_AVAILABLE = False
-AUTOGEN_V4_AVAILABLE = False
-PRAISONAI_TOOLS_AVAILABLE = False
-AGENTOPS_AVAILABLE = False
-PRAISONAI_AVAILABLE = False
+# Import new architecture components
+from .framework_adapters.base import FrameworkAdapter
+from .framework_adapters.registry import FrameworkAdapterRegistry, get_default_registry
+from .tool_registry import ToolRegistry
 
+# Import availability flags
+# Compatibility imports - now handled by centralized detection
+# (inbuilt_tools still defines these but they're read-only compatibility)
+
+# Import BaseTool for tools handling
+BaseTool = None
 try:
-    from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam
-    PRAISONAI_AVAILABLE = True
+    from praisonai_tools import BaseTool
 except ImportError:
-    pass
-
-try:
-    from crewai import Agent, Task, Crew
-    from crewai.telemetry import Telemetry
-    CREWAI_AVAILABLE = True
-except ImportError:
-    pass
-
-try:
-    import autogen
-    AUTOGEN_AVAILABLE = True
-except ImportError:
-    pass
-
-try:
-    from autogen_agentchat.agents import AssistantAgent as AutoGenV4AssistantAgent
-    from autogen_ext.models.openai import OpenAIChatCompletionClient
-    from autogen_agentchat.teams import RoundRobinGroupChat
-    from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
-    from autogen_agentchat.messages import TextMessage
-    from autogen_core import CancellationToken
-    AUTOGEN_V4_AVAILABLE = True
-except ImportError:
-    pass
-
-AG2_AVAILABLE = False
-try:
-    import importlib.metadata as _importlib_metadata
-    _importlib_metadata.distribution('ag2')
-    from autogen import LLMConfig as _AG2LLMConfig  # noqa: F401 — AG2-exclusive class
-    AG2_AVAILABLE = True
-    del _AG2LLMConfig, _importlib_metadata
-except Exception:
-    pass
-
-try:
-    import agentops
-    AGENTOPS_AVAILABLE = True
-    AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
-    if not AGENTOPS_API_KEY:
-        AGENTOPS_AVAILABLE = False
-except ImportError:
-    pass
-
-# Only try to import praisonai_tools if either CrewAI or AutoGen is available
-if CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE or AG2_AVAILABLE:
     try:
-        from praisonai_tools import (
-            CodeDocsSearchTool, CSVSearchTool, DirectorySearchTool, DOCXSearchTool, DirectoryReadTool,
-            FileReadTool, TXTSearchTool, JSONSearchTool, MDXSearchTool, PDFSearchTool, RagTool,
-            ScrapeElementFromWebsiteTool, ScrapeWebsiteTool, WebsiteSearchTool, XMLSearchTool, 
-            YoutubeChannelSearchTool, YoutubeVideoSearchTool, BaseTool
-        )
-        PRAISONAI_TOOLS_AVAILABLE = True
+        from praisonai.tools import BaseTool
     except ImportError:
-        # If import fails, define BaseTool as a simple base class
-        class BaseTool:
-            pass
+        pass
 
-os.environ["OTEL_SDK_DISABLED"] = "true"
+# Check for additional framework availability using centralized detection
+from ._framework_availability import is_available
+PRAISONAI_TOOLS_AVAILABLE = is_available("praisonai_tools")
+CREWAI_AVAILABLE          = is_available("crewai")
+AUTOGEN_AVAILABLE         = is_available("autogen")
+AG2_AVAILABLE             = is_available("ag2")
+PRAISONAI_AVAILABLE       = is_available("praisonaiagents")
+AGENTOPS_AVAILABLE        = is_available("agentops")
+
+# Framework adapter registry - now uses proper registry pattern
+# This replaces the hardcoded FRAMEWORK_ADAPTERS dict
+
+# Note: OTEL_SDK_DISABLED moved to CLI entry point per issue requirements
 
 
 def safe_format(template: str, **kwargs) -> str:
@@ -169,18 +128,53 @@ def sanitize_agent_name_for_autogen_v4(name):
     
     return sanitized
 
-def disable_crewai_telemetry():
-    if CREWAI_AVAILABLE:
-        for attr in dir(Telemetry):
-            if callable(getattr(Telemetry, attr)) and not attr.startswith("__"):
-                setattr(Telemetry, attr, noop)
+def _resolve_yaml_cli_backend(cli_backend_config, logger):
+    """Resolve a YAML ``cli_backend`` field to a CliBackendProtocol instance.
 
-# Only disable telemetry if CrewAI is available
-if CREWAI_AVAILABLE:
-    disable_crewai_telemetry()
+    Accepts ``None`` (no backend), a string id (e.g. ``"claude-code"``), or a
+    dict of shape ``{"id": "claude-code", "overrides": {...}}``. Returns
+    ``None`` on any error after logging a warning, so YAML parsing never raises.
+
+    Kept at module scope so it is unit-testable without constructing a full
+    ``AgentsGenerator`` instance.
+    """
+    if not cli_backend_config:
+        return None
+
+    # Pre-seed label from config before import so we can show it in error logs
+    if isinstance(cli_backend_config, str):
+        label = cli_backend_config
+    elif isinstance(cli_backend_config, dict):
+        label = cli_backend_config.get('id') or "<missing>"
+    else:
+        label = type(cli_backend_config).__name__
+
+    try:
+        from praisonai.cli_backends import resolve_cli_backend
+        if isinstance(cli_backend_config, str):
+            return resolve_cli_backend(cli_backend_config)
+        if isinstance(cli_backend_config, dict):
+            backend_id = cli_backend_config.get('id')
+            if not backend_id:
+                raise ValueError("cli_backend dict must contain an 'id' field")
+            overrides = cli_backend_config.get('overrides') or {}
+            return resolve_cli_backend(backend_id, overrides=overrides)
+        raise ValueError(
+            f"cli_backend must be string or dict, got: {type(cli_backend_config).__name__}"
+        )
+    except ImportError:
+        logger.warning(
+            "CLI backend '%s' requested but not available", label
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to resolve CLI backend '%s': %s", label, e
+        )
+    return None
+
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -194,6 +188,7 @@ class AgentsGenerator:
             agent_yaml (str, optional): The content of the YAML file. Defaults to None.
             tools (dict, optional): A dictionary containing the tools to be used for the agents. Defaults to None.
             cli_config (dict, optional): CLI configuration to override YAML settings. Defaults to None.
+            adapter_registry (FrameworkAdapterRegistry, optional): Registry for framework adapters. Defaults to process default.
 
         Attributes:
             agent_file (str): The path to the agent file.
@@ -213,23 +208,48 @@ class AgentsGenerator:
         self.agent_yaml = agent_yaml
         self.tools = tools or []  # Store tool class names as a list
         self.cli_config = cli_config or {}  # Store CLI configuration overrides
-        self.log_level = log_level or logging.getLogger().getEffectiveLevel()
-        if self.log_level == logging.NOTSET:
-            self.log_level = os.environ.get('LOGLEVEL', 'INFO').upper()
+        # Use namespaced logger - no hot-path basicConfig calls
+        from ._logging import get_logger
+        self.logger = get_logger("agents_generator")
         
-        logging.basicConfig(level=self.log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(self.log_level)
+        # Set level if provided, but don't mutate root logger
+        if log_level:
+            if isinstance(log_level, str):
+                self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+            else:
+                self.logger.setLevel(log_level)
+        elif os.environ.get('LOGLEVEL'):
+            self.logger.setLevel(getattr(logging, os.environ.get('LOGLEVEL', 'INFO').upper(), logging.INFO))
         
-        # Validate framework availability
-        if framework == "crewai" and not CREWAI_AVAILABLE:
-            raise ImportError("CrewAI is not installed. Please install it with 'pip install praisonai[crewai]'")
-        elif framework == "autogen" and not (AUTOGEN_AVAILABLE or AUTOGEN_V4_AVAILABLE):
-            raise ImportError("AutoGen is not installed. Please install it with 'pip install praisonai[autogen]' for v0.2 or 'pip install praisonai[autogen-v4]' for v0.4")
-        elif framework == "praisonai" and not PRAISONAI_AVAILABLE:
-            raise ImportError("PraisonAI is not installed. Please install it with 'pip install praisonaiagents'")
-        elif framework == "ag2" and not AG2_AVAILABLE:
-            raise ImportError("AG2 is not installed. Please install it with 'pip install praisonai[ag2]'")
+        # Initialize tool resolver (single source of truth for tool resolution)
+        from .tool_resolver import ToolResolver
+        self.tool_resolver = ToolResolver()
+        
+        # Keep tool registry for backward compatibility with autogen adapters
+        self.tool_registry = ToolRegistry()
+        self.tool_registry.register_builtin_autogen_adapters()
+        
+        # DI-friendly: tests/multi-tenant runtimes pass their own registry;
+        # CLI users get the process default.
+        self._adapter_registry = adapter_registry or get_default_registry()
+        
+        # Get framework adapter (availability already validated at CLI entry)
+        self.framework_adapter = self._get_framework_adapter(framework)
+
+    def _get_framework_adapter(self, framework: str) -> FrameworkAdapter:
+        """
+        Get the appropriate framework adapter for the given framework.
+        
+        Args:
+            framework: Name of the framework
+            
+        Returns:
+            Framework adapter instance
+            
+        Raises:
+            ValueError: If framework is not supported
+        """
+        return self._adapter_registry.create(framework)
 
     def _merge_cli_config(self, config, cli_config):
         """
@@ -258,26 +278,29 @@ class AgentsGenerator:
                 config['config']['lsp'] = cli_config['lsp'] 
                 self.logger.debug(f"CLI override: lsp = {cli_config['lsp']}")
         
-        # Handle agent-level overrides (trust, tool_timeout, planning_tools, autonomy, guardrail, approval)
-        agent_level_fields = ['trust', 'tool_timeout', 'planning_tools', 'autonomy', 'guardrail', 'approval', 'approve_all_tools', 'approval_timeout']
+        # Handle agent-level overrides using unified approach
+        agent_level_fields = ['tool_timeout', 'planning_tools', 'autonomy']
         agent_overrides = {k: v for k, v in cli_config.items() if k in agent_level_fields}
         
-        # Map CLI field names to YAML field names
-        field_mappings = {
-            'guardrail': 'guardrails',  # CLI uses --guardrail, YAML uses guardrails
-            'trust': 'approval'  # --trust maps to approval=True
-        }
-        
-        # Apply field mappings and special handling
-        for cli_field in field_mappings:
-            if cli_field in agent_overrides:
-                value = agent_overrides.pop(cli_field)
-                if cli_field == 'trust' and value:
-                    # --trust flag maps to approval=True for auto-approval
-                    agent_overrides['approval'] = True
-                elif cli_field == 'guardrail':
-                    # --guardrail "description" maps to guardrails config
-                    agent_overrides['guardrails'] = value
+        # Handle approval configuration using unified spec
+        approval_fields = ['trust', 'approval', 'approve_all_tools', 'approval_timeout', 'approve_level']
+        if any(field in cli_config for field in approval_fields):
+            from ._approval_spec import ApprovalSpec
+            
+            # Create a mock args object for CLI parsing
+            class MockArgs:
+                def __init__(self, cli_config):
+                    for field in approval_fields:
+                        setattr(self, field, cli_config.get(field))
+                    self.guardrail = cli_config.get('guardrail')
+            
+            spec = ApprovalSpec.from_cli(MockArgs(cli_config))
+            if spec.enabled:
+                agent_overrides['approval'] = spec.to_dict()
+            
+        # Handle guardrail separately
+        if 'guardrail' in cli_config:
+            agent_overrides['guardrails'] = cli_config['guardrail']
         
         if agent_overrides:
             # Apply to all agents in the config
@@ -296,6 +319,47 @@ class AgentsGenerator:
                     agent_config[field] = value
                     self.logger.debug(f"CLI override for agent {agent_name}: {field} = {value}")
 
+    def _validate_agents_config(self, config):
+        """
+        Validate agent configuration for typos in field names and provide suggestions.
+        
+        Args:
+            config (dict): The parsed YAML configuration
+        """
+        known_fields = {
+            'role', 'goal', 'instructions', 'backstory', 'tools', 'tasks', 'llm',
+            'function_calling_llm', 'allow_delegation', 'max_iter', 'max_rpm',
+            'max_execution_time', 'verbose', 'cache', 'system_template',
+            'prompt_template', 'response_template', 'tool_timeout', 'planning_tools',
+            'planning', 'autonomy', 'guardrails', 'streaming', 'stream',
+            'approval', 'skills', 'cli_backend', 'reflection'
+        }
+
+        for section_name in ('agents', 'roles'):
+            section = config.get(section_name, {})
+            if not isinstance(section, dict):
+                continue
+
+            entity_name = 'agent' if section_name == 'agents' else 'role'
+            for name, section_config in section.items():
+                if not isinstance(section_config, dict):
+                    continue
+
+                for field_name in section_config:
+                    if field_name in known_fields:
+                        continue
+
+                    close_matches = difflib.get_close_matches(
+                        field_name,
+                        known_fields,
+                        n=1,
+                        cutoff=0.6
+                    )
+                    suggestion = f" Did you mean '{close_matches[0]}'?" if close_matches else ""
+                    self.logger.warning(
+                        f"Unknown field '{field_name}' in {entity_name} '{name}'.{suggestion}"
+                    )
+
     def is_function_or_decorated(self, obj):
         """
         Checks if the given object is a function or has a __call__ method.
@@ -310,39 +374,48 @@ class AgentsGenerator:
 
     def load_tools_from_module(self, module_path):
         """
-        Loads tools from a specified module path.
+        Load function tools from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
 
         Parameters:
             module_path (str): The path to the module containing the tools.
 
         Returns:
             dict: A dictionary containing the names of the tools as keys and the corresponding functions or objects as values.
-
-        Raises:
-            FileNotFoundError: If the specified module path does not exist.
+                  Returns an empty dict if the module cannot be loaded (path missing, loading blocked by PRAISONAI_ALLOW_LOCAL_TOOLS, or any other load error).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
+            return {}
         return {name: obj for name, obj in inspect.getmembers(module, self.is_function_or_decorated)}
+    
+    def _extract_tool_classes(self, module):
+        """
+        Extract tool classes from a loaded module that inherit from BaseTool 
+        or are part of langchain_community.tools package.
+        """
+        result = {}
+        for name, obj in inspect.getmembers(module, 
+            lambda x: inspect.isclass(x) and (
+                x.__module__.startswith('langchain_community.tools') or 
+                (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
+            ) and x is not BaseTool):
+            try:
+                result[name] = obj()
+            except Exception as e:
+                self.logger.warning(f"Error instantiating tool class {name}: {e}")
+                continue
+        return result
     
     def load_tools_from_module_class(self, module_path):
         """
-        Loads tools from a specified module path containing classes that inherit from BaseTool 
-        or are part of langchain_community.tools package.
+        Load BaseTool / langchain tool classes from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-            return {name: obj() for name, obj in inspect.getmembers(module, 
-                lambda x: inspect.isclass(x) and (
-                    x.__module__.startswith('langchain_community.tools') or 
-                    (PRAISONAI_TOOLS_AVAILABLE and issubclass(x, BaseTool))
-                ) and x is not BaseTool)}
-        except ImportError as e:
-            self.logger.warning(f"Error loading tools from {module_path}: {e}")
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
             return {}
+        return self._extract_tool_classes(module)
 
     def load_tools_from_package(self, package_path):
         """
@@ -368,46 +441,6 @@ class AgentsGenerator:
                     tools_dict[name] = obj
         return tools_dict
 
-    def load_tools_from_tools_py(self):
-        """
-        Imports and returns all contents from tools.py file.
-        Also adds the tools to the global namespace.
-
-        Returns:
-            list: A list of callable functions with proper formatting
-        """
-        tools_list = []
-        try:
-            # Try to import tools.py from current directory
-            spec = importlib.util.spec_from_file_location("tools", "tools.py")
-            self.logger.debug(f"Spec: {spec}")
-            if spec is None:
-                self.logger.debug("tools.py not found in current directory")
-                return tools_list
-
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            # Get all module attributes except private ones and classes
-            for name, obj in inspect.getmembers(module):
-                if (not name.startswith('_') and 
-                    callable(obj) and 
-                    not inspect.isclass(obj)):
-                    # Add the function to global namespace
-                    globals()[name] = obj
-                    # Add to tools list
-                    tools_list.append(obj)
-                    self.logger.debug(f"Loaded and globalized tool function: {name}")
-
-            self.logger.debug(f"Loaded {len(tools_list)} tool functions from tools.py")
-            self.logger.debug(f"Tools list: {tools_list}")
-            
-        except FileNotFoundError:
-            self.logger.debug("tools.py not found in current directory")
-        except Exception as e:
-            self.logger.warning(f"Error loading tools from tools.py: {e}")
-            
-        return tools_list
 
     def generate_crew_and_kickoff(self):
         """
@@ -473,33 +506,42 @@ class AgentsGenerator:
 
         # Get workflow input: 'input' is canonical, 'topic' is alias for backward compatibility
         topic = config.get('input', config.get('topic', ''))
+        
+        # Validate agents configuration for typos in field names
+        self._validate_agents_config(config)
+        
         tools_dict = {}
         
-        # Only try to use praisonai_tools if it's available and needed
+        # Use ToolResolver to get available tools (consistent tool resolution)
         if PRAISONAI_TOOLS_AVAILABLE and (CREWAI_AVAILABLE or AUTOGEN_AVAILABLE or PRAISONAI_AVAILABLE or AG2_AVAILABLE):
-            tools_dict = {
-                'CodeDocsSearchTool': CodeDocsSearchTool(),
-                'CSVSearchTool': CSVSearchTool(),
-                'DirectorySearchTool': DirectorySearchTool(),
-                'DOCXSearchTool': DOCXSearchTool(),
-                'DirectoryReadTool': DirectoryReadTool(),
-                'FileReadTool': FileReadTool(),
-                'TXTSearchTool': TXTSearchTool(),
-                'JSONSearchTool': JSONSearchTool(),
-                'MDXSearchTool': MDXSearchTool(),
-                'PDFSearchTool': PDFSearchTool(),
-                'RagTool': RagTool(),
-                'ScrapeElementFromWebsiteTool': ScrapeElementFromWebsiteTool(),
-                'ScrapeWebsiteTool': ScrapeWebsiteTool(),
-                'WebsiteSearchTool': WebsiteSearchTool(),
-                'XMLSearchTool': XMLSearchTool(),
-                'YoutubeChannelSearchTool': YoutubeChannelSearchTool(),
-                'YoutubeVideoSearchTool': YoutubeVideoSearchTool(),
-            }
+            try:
+                # Get available tools from the resolver
+                available_tools = self.tool_resolver.list_available()
+                tools_dict = {}
+                
+                # Standard praisonai-tools tool names
+                standard_tools = [
+                    'CodeDocsSearchTool', 'CSVSearchTool', 'DirectorySearchTool', 'DOCXSearchTool',
+                    'DirectoryReadTool', 'FileReadTool', 'TXTSearchTool', 'JSONSearchTool',
+                    'MDXSearchTool', 'PDFSearchTool', 'RagTool', 'ScrapeElementFromWebsiteTool',
+                    'ScrapeWebsiteTool', 'WebsiteSearchTool', 'XMLSearchTool',
+                    'YoutubeChannelSearchTool', 'YoutubeVideoSearchTool',
+                ]
+                
+                # Resolve only tools that are actually available
+                for tool_name in standard_tools:
+                    if tool_name in available_tools:
+                        resolved_tool = self.tool_resolver.resolve(tool_name)
+                        if resolved_tool is not None:
+                            tools_dict[tool_name] = resolved_tool() if inspect.isclass(resolved_tool) else resolved_tool
+                            
+            except Exception as e:
+                self.logger.debug(f"Error resolving praisonai_tools: {e}")
+                tools_dict = {}
             
             # Add tools from class names
             for tool_class in self.tools:
-                if isinstance(tool_class, type) and issubclass(tool_class, BaseTool):
+                if isinstance(tool_class, type) and BaseTool and issubclass(tool_class, BaseTool):
                     tool_name = tool_class.__name__
                     tools_dict[tool_name] = tool_class()
                     self.logger.debug(f"Added tool: {tool_name}")
@@ -508,63 +550,69 @@ class AgentsGenerator:
         tools_py_path = os.path.join(root_directory, 'tools.py')
         tools_dir_path = Path(root_directory) / 'tools'
         
+        # Use consolidated ToolResolver for tools.py loading
+        tools_dict.update(self.tool_resolver.get_local_tool_classes())
         if os.path.isfile(tools_py_path):
-            tools_dict.update(self.load_tools_from_module_class(tools_py_path))
             self.logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
         elif tools_dir_path.is_dir():
-            tools_dict.update(self.load_tools_from_module_class(tools_dir_path))
-            self.logger.debug("tools folder exists in the root directory")
+            from ._safe_loader import load_user_module
+            for py_file in tools_dir_path.glob("*.py"):
+                if py_file.name.startswith("__"):
+                    continue
+                module = load_user_module(py_file, name=f"tools_{py_file.stem}")
+                if module is not None:
+                    tools_dict.update(self._extract_tool_classes(module))
+            if tools_dict:
+                self.logger.debug("tools folder exists in the root directory")
 
-        framework = self.framework or config.get('framework')
+        framework = self.framework or config.get('framework', 'crewai')
 
+        # Determine AutoGen version if needed (keeping compatibility logic)
         if framework == "autogen":
-            if not (AUTOGEN_AVAILABLE or AUTOGEN_V4_AVAILABLE):
-                raise ImportError("AutoGen is not installed. Please install it with 'pip install praisonai[autogen]' for v0.2 or 'pip install praisonai[autogen-v4]' for v0.4")
-            
-            # Choose autogen version based on availability and environment preference
-            # AUTOGEN_VERSION can be set to "v0.2" or "v0.4" to force a specific version
             autogen_version = os.environ.get("AUTOGEN_VERSION", "auto").lower()
+            autogen_v4_adapter = self._get_framework_adapter("autogen_v4")
+            autogen_v2_adapter = self._get_framework_adapter("autogen")
             
             use_v4 = False
-            if autogen_version == "v0.4" and AUTOGEN_V4_AVAILABLE:
+            if autogen_version == "v0.4" and autogen_v4_adapter.is_available():
                 use_v4 = True
-            elif autogen_version == "v0.2" and AUTOGEN_AVAILABLE:
+            elif autogen_version == "v0.2" and autogen_v2_adapter.is_available():
                 use_v4 = False
             elif autogen_version == "auto":
-                # Default preference: use v0.4 if available, fallback to v0.2
-                use_v4 = AUTOGEN_V4_AVAILABLE
+                use_v4 = autogen_v4_adapter.is_available()
             else:
-                # Fallback to whatever is available
-                use_v4 = AUTOGEN_V4_AVAILABLE and not AUTOGEN_AVAILABLE
+                use_v4 = autogen_v4_adapter.is_available() and not autogen_v2_adapter.is_available()
             
-            if AGENTOPS_AVAILABLE:
-                version_tag = "autogen-v4" if use_v4 else "autogen-v2"
-                agentops.init(os.environ.get("AGENTOPS_API_KEY"), default_tags=[version_tag])
+            framework = "autogen_v4" if use_v4 else "autogen"
             
-            if use_v4:
-                self.logger.info("Using AutoGen v0.4")
-                return self._run_autogen_v4(config, topic, tools_dict)
-            else:
-                self.logger.info("Using AutoGen v0.2")
-                return self._run_autogen(config, topic, tools_dict)
-        elif framework == "ag2":
-            if not AG2_AVAILABLE:
-                raise ImportError("AG2 is not installed. Please install it with 'pip install praisonai[ag2]'")
-            if AGENTOPS_AVAILABLE:
-                agentops.init(os.environ.get("AGENTOPS_API_KEY"), default_tags=["ag2"])
-            return self._run_ag2(config, topic, tools_dict)
-        elif framework == "praisonai":
-            if not PRAISONAI_AVAILABLE:
-                raise ImportError("PraisonAI is not installed. Please install it with 'pip install praisonaiagents'")
-            if AGENTOPS_AVAILABLE:
-                agentops.init(os.environ.get("AGENTOPS_API_KEY"), default_tags=["praisonai"])
-            return self._run_praisonai(config, topic, tools_dict)
-        else:  # framework=crewai
-            if not CREWAI_AVAILABLE:
-                raise ImportError("CrewAI is not installed. Please install it with 'pip install praisonai[crewai]'")
-            if AGENTOPS_AVAILABLE:
-                agentops.init(os.environ.get("AGENTOPS_API_KEY"), default_tags=["crewai"])
-            return self._run_crewai(config, topic, tools_dict)
+        # Initialize AgentOps if available
+        try:
+            import agentops
+            agentops_api_key = os.getenv("AGENTOPS_API_KEY")
+            if agentops_api_key:
+                agentops.init(agentops_api_key, default_tags=[framework])
+        except ImportError:
+            pass
+            
+        # Update framework adapter if framework changed (e.g., AutoGen version selection)
+        if framework != self.framework:
+            self.framework = framework
+            self.framework_adapter = self._get_framework_adapter(framework)
+            
+        # Validate framework availability for non-CLI callers
+        from .framework_adapters.validators import assert_framework_available
+        assert_framework_available(framework)
+        
+        self.logger.info(f"Using framework: {framework}")
+        return self.framework_adapter.run(
+            config,
+            self.config_list,
+            topic,
+            tools_dict=tools_dict,
+            agent_callback=getattr(self, 'agent_callback', None),
+            task_callback=getattr(self, 'task_callback', None),
+            cli_config=getattr(self, 'cli_config', None),
+        )
 
     def _run_yaml_workflow(self, config):
         """
@@ -666,13 +714,16 @@ class AgentsGenerator:
             # Add tools to agent if specified
             for tool in details.get('tools', []):
                 if tool in tools_dict:
-                    try:
-                        tool_class = globals()[f'autogen_{type(tools_dict[tool]).__name__}']
-                        self.logger.debug(f"Found {tool_class.__name__} for {tool}")
-                        tool_class(agents[role], user_proxy)
-                    except KeyError:
-                        self.logger.warning(f"Warning: autogen_{type(tools_dict[tool]).__name__} function not found. Skipping this tool.")
-                        continue
+                    tool_type_name = type(tools_dict[tool]).__name__
+                    adapter = self.tool_registry.get_autogen_adapter(tool_type_name)
+                    if adapter:
+                        try:
+                            self.logger.debug(f"Found AutoGen adapter for {tool_type_name}")
+                            adapter(agents[role], user_proxy)
+                        except Exception as e:
+                            self.logger.warning(f"Error applying AutoGen adapter for {tool}: {e}")
+                    else:
+                        self.logger.warning(f"Warning: No AutoGen adapter found for {tool_type_name}. Skipping this tool.")
 
             # Prepare tasks
             for task_name, task_details in details.get('tasks', {}).items():
@@ -691,7 +742,11 @@ class AgentsGenerator:
         result = "### Output ###\n" + response[-1].summary if hasattr(response[-1], 'summary') else ""
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -795,9 +850,10 @@ class AgentsGenerator:
                 # Close the model client
                 await model_client.close()
         
-        # Run the async function
+        # Run the async function using safe bridge
+        from ._async_bridge import run_sync
         try:
-            return asyncio.run(run_autogen_v4_async())
+            return run_sync(run_autogen_v4_async())
         except Exception as e:
             self.logger.error(f"Error running AutoGen v0.4: {str(e)}")
             return f"### AutoGen v0.4 Error ###\n{str(e)}"
@@ -842,10 +898,13 @@ class AgentsGenerator:
         api_type = _resolve("api_type", default="openai").lower()
         model_name = _resolve("model", default="gpt-4o-mini")
         api_key = _resolve("api_key", env_var="OPENAI_API_KEY")
+        # Use resolver for consistent env-var precedence as fallback
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
+        
         base_url = (model_config.get("base_url")
                     or yaml_llm.get("base_url")
-                    or os.environ.get("OPENAI_BASE_URL")
-                    or os.environ.get("OPENAI_API_BASE"))
+                    or ep.base_url)
 
         # Build LLMConfig — Bedrock needs no api_key
         if api_type == "bedrock":
@@ -1074,7 +1133,11 @@ class AgentsGenerator:
         result = f"### Task Output ###\n{response}"
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -1091,12 +1154,10 @@ class AgentsGenerator:
         tasks = []
         tasks_dict = {}
 
-        # Import tool resolver (lazy import to avoid circular deps)
-        from praisonai.tool_resolver import ToolResolver
-        tool_resolver = ToolResolver()
+        # Use existing tool resolver instance
         
-        # Load tools from local tools.py (backward compat)
-        tools_list = self.load_tools_from_tools_py()
+        # Load tools from local tools.py (backward compat) - use consolidated ToolResolver
+        tools_list = self.tool_resolver.get_local_callables()
         self.logger.debug(f"Loaded tools from tools.py: {tools_list}")
 
         # Initialize InteractiveRuntime for ACP/LSP if enabled globally
@@ -1104,17 +1165,15 @@ class AgentsGenerator:
         acp_enabled = global_config.get('acp', False)
         lsp_enabled = global_config.get('lsp', False)
         interactive_runtime = None
-        interactive_loop = None
         
         if acp_enabled or lsp_enabled:
+            runtime_started = False
             try:
                 import asyncio
-                import os
                 from praisonai.cli.features.interactive_runtime import InteractiveRuntime, RuntimeConfig
                 from praisonai.cli.features.agent_tools import create_agent_centric_tools
-                import nest_asyncio
                 
-                nest_asyncio.apply()
+                # Use scoped event loop instead of process-global mutations
                 runtime_config = RuntimeConfig(
                     workspace=os.getcwd(),
                     acp_enabled=acp_enabled,
@@ -1124,22 +1183,34 @@ class AgentsGenerator:
                 interactive_runtime = InteractiveRuntime(runtime_config)
                 self.logger.info(f"Starting InteractiveRuntime (ACP: {acp_enabled}, LSP: {lsp_enabled})")
                 
-                try:
-                    interactive_loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    interactive_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(interactive_loop)
-                
-                interactive_loop.run_until_complete(interactive_runtime.start())
+                # Runs on the persistent background loop; safe from sync and async callers.
+                # run_sync raises RuntimeError early if called from inside a running loop
+                # so the bug is loud instead of a deadlock.
+                from ._async_bridge import run_sync
+                run_sync(interactive_runtime.start())
+                runtime_started = True
                 
                 centric_tools = create_agent_centric_tools(interactive_runtime)
-                self.logger.info(f"Injected {len(centric_tools)} InteractiveRuntime tools globally")
+                self.logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
                 tools_list.extend(centric_tools)
                 
             except ImportError as e:
                 self.logger.warning(f"Failed to load InteractiveRuntime components: {e}")
+                interactive_runtime = None
+            except RuntimeError:
+                # Don't swallow RuntimeError from run_sync - preserve fail-fast semantics
+                raise
             except Exception as e:
+                if runtime_started and interactive_runtime is not None:
+                    try:
+                        from ._async_bridge import run_sync
+                        run_sync(interactive_runtime.stop())
+                    except Exception as stop_error:
+                        self.logger.error(
+                            f"Error stopping partially started InteractiveRuntime: {stop_error}"
+                        )
                 self.logger.error(f"Error starting InteractiveRuntime: {e}")
+                interactive_runtime = None
 
         # Create agents from config
         for role, details in config['roles'].items():
@@ -1166,7 +1237,7 @@ class AgentsGenerator:
                     )
                     
                     if not already_loaded:
-                        resolved_tool = tool_resolver.resolve(tool_name)
+                        resolved_tool = self.tool_resolver.resolve(tool_name)
                         if resolved_tool is not None:
                             agent_tools.append(resolved_tool)
                             self.logger.debug(f"Resolved tool '{tool_name}' for agent {role}")
@@ -1223,39 +1294,27 @@ class AgentsGenerator:
                 stream_enabled = cli_config.get('stream', False)
                 stream_metrics = cli_config.get('stream_metrics', False)
             
-            # Reconstruct approval config from potentially scattered settings
-            approval_val = details.get('approval')
-            approve_all = details.get('approve_all_tools')
-            approval_timeout = details.get('approval_timeout')
-            
+            # Use unified approval specification
             approval_config = None
-            if approval_val is not None or approve_all is not None or approval_timeout is not None:
-                if isinstance(approval_val, dict):
-                    approval_dict = approval_val
-                else:
-                    approval_dict = {'backend': approval_val}
-                
-                if approve_all is not None:
-                    approval_dict['approve_all_tools'] = approve_all
-                if approval_timeout is not None:
-                    approval_dict['approval_timeout'] = approval_timeout
-                
+            if 'approval' in details:
+                from ._approval_spec import ApprovalSpec
                 try:
-                    from .cli.features.approval import resolve_approval_config
-                    # Map common YAML fields to resolve_approval_config parameters
-                    approval_config = resolve_approval_config(
-                        backend_name=approval_dict.get('backend') or approval_dict.get('backend_name'),
-                        all_tools=approval_dict.get('approve_all_tools') or approval_dict.get('all_tools', False),
-                        timeout=approval_dict.get('approval_timeout') or approval_dict.get('timeout')
+                    spec = ApprovalSpec.from_yaml(details.get('approval'))
+                    if spec.enabled:
+                        from .cli.features.approval import resolve_approval_config
+                        approval_config = resolve_approval_config(
+                            backend_name=spec.backend,
+                            all_tools=spec.approve_all_tools,
+                            timeout=spec.timeout
                     )
                 except ImportError:
                     # Fallback: Create ApprovalConfig directly if resolve_approval_config isn't available
                     try:
                         from praisonaiagents.approval.protocols import ApprovalConfig
                         approval_config = ApprovalConfig(
-                            backend=approval_dict.get('backend', None),
-                            all_tools=approval_dict.get('approve_all_tools', approval_dict.get('all_tools', False)),
-                            timeout=approval_dict.get('approval_timeout', approval_dict.get('timeout', 0))
+                            backend=spec.backend,
+                            all_tools=spec.approve_all_tools,
+                            timeout=spec.timeout
                         )
                     except ImportError:
                         # Last resort: disable approval for this agent
@@ -1270,6 +1329,15 @@ class AgentsGenerator:
                 except ImportError:
                     self.logger.warning("OutputConfig not available, streaming disabled")
             
+            # G16: YAML `skills:` key. Accepts a list of paths, a single path
+            # string, or a full SkillsConfig dict (paths/dirs/auto_discover).
+            agent_skills = details.get('skills')
+
+            # H17: CLI Backend support - delegates full turns to external CLI tools
+            cli_backend_resolved = _resolve_yaml_cli_backend(
+                details.get('cli_backend'), self.logger
+            )
+
             agent = PraisonAgent(
                 name=role_filled,
                 role=role_filled,
@@ -1286,6 +1354,8 @@ class AgentsGenerator:
                 guardrails=guardrails_config,
                 approval=approval_config,
                 output=output_config,
+                skills=agent_skills,
+                cli_backend=cli_backend_resolved,
             )
             
             if self.agent_callback:
@@ -1374,14 +1444,19 @@ class AgentsGenerator:
             self.logger.debug(f"Result: {response}")
             result = response if response else ""
         finally:
-            if interactive_runtime and interactive_loop:
+            if interactive_runtime:
                 try:
                     self.logger.info("Stopping InteractiveRuntime...")
-                    interactive_loop.run_until_complete(interactive_runtime.stop())
+                    from ._async_bridge import run_sync
+                    run_sync(interactive_runtime.stop())
                 except Exception as e:
                     self.logger.error(f"Error stopping InteractiveRuntime: {e}")
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result

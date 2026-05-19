@@ -9,7 +9,8 @@ import json
 import logging
 from typing import List, Optional
 
-from .base import ConversationStore, ConversationSession, ConversationMessage
+from .base import ConversationStore, ConversationSession, ConversationMessage, validate_identifier
+from ..._async_bridge import run_sync
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class SurrealDBConversationStore(ConversationStore):
         self.database = database
         self.username = username
         self.password = password
+        validate_identifier(table_prefix, "table_prefix")
         self.table_prefix = table_prefix
         self.sessions_table = f"{table_prefix}sessions"
         self.messages_table = f"{table_prefix}messages"
@@ -73,23 +75,11 @@ class SurrealDBConversationStore(ConversationStore):
                 await self._client.signin({"user": self.username, "pass": self.password})
             await self._client.use(self.namespace, self.database)
         
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        loop.run_until_complete(_init())
+        run_sync(_init())
     
     def _run_sync(self, coro):
         """Run async coroutine synchronously."""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
+        return run_sync(coro)
     
     def create_session(self, session: ConversationSession) -> ConversationSession:
         data = {

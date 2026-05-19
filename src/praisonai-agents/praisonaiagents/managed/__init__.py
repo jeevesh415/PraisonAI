@@ -25,6 +25,7 @@ from .protocols import (
     ComputeConfig,
     InstanceInfo,
     InstanceStatus,
+    ManagedRuntimeProtocol,
 )
 
 __all__ = [
@@ -41,4 +42,14 @@ __all__ = [
     "ComputeConfig",
     "InstanceInfo",
     "InstanceStatus",
+    "ManagedRuntimeProtocol",
+    "ManagedBackendProtocol",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy import ManagedBackendProtocol to keep module lightweight."""
+    if name == "ManagedBackendProtocol":
+        from ..agent.protocols import ManagedBackendProtocol
+        return ManagedBackendProtocol
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -120,6 +120,11 @@ class LearnConfig:
     feedback: bool = False     # Outcome signals
     improvements: bool = False # Self-improvement proposals
     
+    # Nudge mechanism (self-improving agent loop)
+    nudge_interval: int = 0    # 0=disabled; N=nudge every N turns  
+    nudge_min_tool_iters: int = 3  # Only nudge if agent did real work
+    propose_skills: bool = False   # Enable skill_manage tool (propose mode)
+    
     # Learning mode
     mode: Union[str, LearnMode] = LearnMode.DISABLED  # How to extract learnings
     
@@ -144,6 +149,9 @@ class LearnConfig:
             "decisions": self.decisions,
             "feedback": self.feedback,
             "improvements": self.improvements,
+            "nudge_interval": self.nudge_interval,
+            "nudge_min_tool_iters": self.nudge_min_tool_iters,
+            "propose_skills": self.propose_skills,
             "mode": self.mode.value if isinstance(self.mode, LearnMode) else self.mode,
             "scope": self.scope.value if isinstance(self.scope, LearnScope) else self.scope,
             "backend": self.backend.value if isinstance(self.backend, LearnBackend) else self.backend,
@@ -735,6 +743,11 @@ class ExecutionConfig:
     # Action when budget exceeded: "stop" (default) raises BudgetExceededError,
     # "warn" logs warning but continues, or callable(total_cost, max_budget).
     on_budget_exceeded: Any = "stop"
+    
+    # Parallel tool execution (Gap 2): Enable parallel execution of batched LLM tool calls
+    # When True, multiple tool calls from LLM are executed concurrently instead of sequentially
+    # Default False preserves existing behavior for backward compatibility
+    parallel_tool_calls: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -749,6 +762,7 @@ class ExecutionConfig:
             "context_compaction": self.context_compaction,
             "max_context_tokens": self.max_context_tokens,
             "max_budget": self.max_budget,
+            "parallel_tool_calls": self.parallel_tool_calls,
         }
 
 

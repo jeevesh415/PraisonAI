@@ -16,30 +16,37 @@ def realtime_main(
     ctx: typer.Context,
     model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model to use"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    port: int = typer.Option(8085, "--port", "-p", help="Port for realtime UI"),
 ):
     """
     Start realtime interaction mode.
     
+    Now routes to the new aiui-based realtime interface.
+    
     Examples:
         praisonai realtime
-        praisonai realtime --model gpt-4o
+        praisonai realtime --model gpt-4o --port 9000
     """
-    from praisonai.cli.main import PraisonAI
-    import sys
+    import os
     
-    argv = ['realtime']
     if model:
-        argv.extend(['--model', model])
-    if verbose:
-        argv.append('--verbose')
+        os.environ["MODEL_NAME"] = model
     
-    original_argv = sys.argv
-    sys.argv = ['praisonai'] + argv
-    
+    print("🎤 Launching PraisonAI Realtime Voice Interface...")
+    print("Note: Migrated from Chainlit to aiui.")
+
     try:
-        praison = PraisonAI()
-        praison.main()
-    except SystemExit:
-        pass
-    finally:
-        sys.argv = original_argv
+        from praisonai.cli.commands.ui import _launch_aiui_app
+        _launch_aiui_app(
+            app_dir="ui_realtime",
+            default_app_name="ui_realtime",
+            port=port,
+            host="127.0.0.1",
+            app_file=None,
+            reload=False,
+            ui_name="Realtime Voice"
+        )
+    except ImportError:
+        print('\033[91mERROR: Realtime UI is not installed.\033[0m')
+        print('Install with: pip install "praisonai[ui]"')
+        raise typer.Exit(1)

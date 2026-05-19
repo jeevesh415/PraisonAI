@@ -2,8 +2,9 @@ import os
 import time
 import json
 import logging
+import threading
 from praisonaiagents._logging import get_logger
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from ..main import display_error, TaskOutput
 from ..agent.agent import Agent
 from ..task.task import Task
@@ -18,6 +19,12 @@ try:
 except ImportError:
     _token_collector = None
 
+# Import async utility for hot-path usage
+try:
+    from ..approval.utils import run_coroutine_safely
+except ImportError:
+    run_coroutine_safely = None
+
 # Task status constants
 class TaskStatus(Enum):
     """Enumeration for task status values to ensure consistency"""
@@ -30,12 +37,118 @@ class TaskStatus(Enum):
 # Set up logger
 logger = get_logger(__name__)
 
-# Global variables for managing the shared servers with thread-safety
-import threading
-_agents_server_lock = threading.Lock()  # Protect all global server state mutations
-_agents_server_started = {}  # Dict of port -> started boolean
-_agents_registered_endpoints = {}  # Dict of port -> Dict of path -> endpoint_id
-_agents_shared_apps = {}  # Dict of port -> FastAPI app
+# Agent server registry for thread-safe server management
+
+
+class _AgentServerRegistry:
+    """Encapsulates all shared HTTP server state with proper synchronization."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._started: Dict[int, bool] = {}
+        self._endpoints: Dict[int, Dict[str, str]] = {}
+        self._apps: Dict[int, Any] = {}  # FastAPI apps
+        self._ready_events: Dict[int, threading.Event] = {}
+    
+    def get_or_create_app(self, port: int, title: str = "AgentTeam API") -> Tuple[Any, bool]:
+        """Thread-safe app creation. Returns (app, is_new)."""
+        with self._lock:
+            if port not in self._apps:
+                # Lazy import to avoid optional dependency at module level
+                from fastapi import FastAPI
+                self._apps[port] = FastAPI(title=title)
+                self._endpoints[port] = {}
+                self._ready_events[port] = threading.Event()
+                return self._apps[port], True
+            return self._apps[port], False
+    
+    def register_route(self, port: int, path: str, endpoint_id: str = "registered") -> None:
+        """Thread-safe route registration tracking."""
+        with self._lock:
+            if port not in self._endpoints:
+                self._endpoints[port] = {}
+            self._endpoints[port][path] = endpoint_id
+
+    def reserve_route(self, port: int, path: str, endpoint_id: str) -> tuple[str, Optional[str]]:
+        """Atomically reserve and register a route.
+
+        Returns:
+            tuple[str, Optional[str]]: (final_path, original_path_if_collided).
+            If there is no collision, final_path equals the requested path and
+            original_path_if_collided is None.
+        """
+        with self._lock:
+            if port not in self._endpoints:
+                self._endpoints[port] = {}
+
+            original_path = path
+            while path in self._endpoints[port]:
+                path = f"{original_path}_{str(uuid.uuid4())[:6]}"
+
+            self._endpoints[port][path] = endpoint_id
+            return path, (original_path if path != original_path else None)
+
+    def list_routes(self, port: int) -> List[str]:
+        """Return a snapshot list of registered routes for a port."""
+        with self._lock:
+            return list(self._endpoints.get(port, {}).keys())
+    
+    def has_route(self, port: int, path: str) -> bool:
+        """Thread-safe check whether a path is registered on a port."""
+        with self._lock:
+            return path in self._endpoints.get(port, {})
+    
+    def is_server_started(self, port: int) -> bool:
+        """Check if server is started for this port."""
+        with self._lock:
+            return self._started.get(port, False)
+    
+    def start_server_if_needed(self, port: int, host: str = "0.0.0.0", **kwargs) -> bool:  # noqa: S104
+        """Start server with proper readiness signaling. Returns True if server was started."""
+        with self._lock:
+            if self._started.get(port, False):
+                return False  # Already started
+            self._started[port] = True
+            app = self._apps.get(port)
+            
+        if not app:
+            raise ValueError(f"No app registered for port {port}")
+        
+        ready_event = self._ready_events[port]
+        
+        def run_server():
+            import uvicorn
+            # Remove hardcoded log_level to avoid conflict with kwargs
+            config = uvicorn.Config(app, host=host, port=port, **kwargs)
+            server = uvicorn.Server(config)
+            ready_event.set()  # Signal readiness
+            server.run()
+        
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
+        
+        # Check for configurable timeout via environment variable
+        try:
+            timeout = float(os.environ.get("PRAISONAI_SERVER_READY_TIMEOUT", "5.0"))
+        except ValueError:
+            logger.warning("Invalid PRAISONAI_SERVER_READY_TIMEOUT value. Using default 5.0s.")
+            timeout = 5.0
+        became_ready = ready_event.wait(timeout=timeout)
+        
+        if not became_ready:
+            logger.warning(
+                "Agent server on port %s did not become ready within %.1fs. "
+                "Proceeding, but some features may not work correctly. "
+                "Check server logs for startup errors.",
+                port,
+                timeout,
+            )
+        
+        return True
+
+
+# Module level — single registry instance
+_server_registry = _AgentServerRegistry()
 
 def encode_file_to_base64(file_path: str) -> str:
     """Base64-encode a file."""
@@ -914,31 +1027,83 @@ class AgentTeam:
             logger.info(f"Task with ID {task_id} is already completed")
             return
 
+        # Use per-task max_retries if available
+        task_max = getattr(task, "max_retries", self.max_retries)
         retries = 0
-        while task.status != "completed" and retries < self.max_retries:
+        while task.status != "completed" and retries < task_max:
             logger.debug(f"Attempt {retries+1} for task {task_id}")
             if task.status in ["not started", "in progress"]:
                 task_output = await self.aexecute_task(task_id)
                 if task_output and self.completion_checker(task, task_output.raw):
+                    # Run guardrail validation BEFORE marking task complete
+                    if task._guardrail_fn:
+                        try:
+                            guardrail_result = task._process_guardrail(task_output)
+                            if not guardrail_result.success:
+                                if task.retry_count >= task.max_retries:
+                                    raise Exception(
+                                        f"Task failed guardrail validation after {task.max_retries} retries. "
+                                        f"Last error: {guardrail_result.error}"
+                                    )
+                                
+                                task.retry_count += 1
+                                task.status = "in progress"  # Keep task in progress for retry
+                                logger.warning(f"Task {task_id}: Guardrail validation failed (retry {task.retry_count}/{task.max_retries}): {guardrail_result.error}")
+                                retries += 1
+                                continue  # Actually retry the task
+                            
+                            # If guardrail passed and returned a modified result
+                            if guardrail_result.result is not None:
+                                if isinstance(guardrail_result.result, str):
+                                    # Update the task output with the modified result
+                                    task_output.raw = guardrail_result.result
+                                    # Clear structured fields to avoid stale cache
+                                    if hasattr(task_output, 'json_dict'):
+                                        task_output.json_dict = None
+                                    if hasattr(task_output, 'pydantic'):
+                                        task_output.pydantic = None
+                                    task.result = task_output
+                                elif hasattr(guardrail_result.result, 'raw'):
+                                    # Replace with the new task output
+                                    task_output = guardrail_result.result
+                                    task.result = task_output
+                            
+                            logger.info(f"Task {task_id}: Guardrail validation passed")
+                        except Exception as e:
+                            logger.error(f"Task {task_id}: Error in guardrail processing: {e}")
+                            # Handle guardrail failure with retry logic
+                            if task.retry_count >= task.max_retries:
+                                raise Exception(
+                                    f"Task failed due to guardrail processing error after {task.max_retries} retries. "
+                                    f"Last error: {e}"
+                                ) from e
+                            task.retry_count += 1
+                            task.status = "in progress"
+                            logger.warning(f"Task {task_id}: Guardrail processing error (retry {task.retry_count}/{task.max_retries}): {e}")
+                            retries += 1
+                            continue  # Retry the task
+                    
                     task.status = "completed"
                     # Run execute_callback for memory operations
                     try:
-                        # Use the new sync wrapper to avoid pending coroutine issues
-                        task.execute_callback_sync(task_output)
+                        await task.execute_callback(task_output)
                     except Exception as e:
                         logger.error(f"Error executing memory callback for task {task_id}: {e}")
                         logger.exception(e)
+                        # Respect task failure policies - re-raise if configured
+                        if hasattr(task, 'fail_on_callback_error') and task.fail_on_callback_error:
+                            raise
+                        if hasattr(task, 'fail_on_memory_error') and task.fail_on_memory_error:
+                            raise
                     
                     # Run task callback if exists
                     if task.callback:
                         try:
                             if asyncio.iscoroutinefunction(task.callback):
-                                try:
-                                    loop = asyncio.get_running_loop()
-                                    loop.create_task(task.callback(task_output))
-                                except RuntimeError:
-                                    # No event loop running, create new one
-                                    asyncio.run(task.callback(task_output))
+                                if run_coroutine_safely:
+                                    run_coroutine_safely(task.callback(task_output))
+                                else:
+                                    logger.warning("run_coroutine_safely not available, skipping async callback")
                             else:
                                 task.callback(task_output)
                         except Exception as e:
@@ -952,7 +1117,11 @@ class AgentTeam:
                     task.status = "in progress"
                     if self.verbose >= 1:
                         logger.info(f"Task {task_id} not completed, retrying")
-                    await asyncio.sleep(1)
+                    # Use task's retry policy instead of hardcoded sleep (with cap)
+                    delay = getattr(task, 'retry_delay', 1)
+                    max_delay = getattr(task, 'max_retry_delay', 300)  # 5 min cap
+                    actual_delay = min(delay * (2 ** retries), max_delay)
+                    await asyncio.sleep(actual_delay)
                     retries += 1
             else:
                 if task.status == "failed":
@@ -962,8 +1131,9 @@ class AgentTeam:
                     logger.info("Invalid Task status")
                     break
 
-        if retries == self.max_retries and task.status != "completed":
-            logger.info(f"Task {task_id} failed after {self.max_retries} retries.")
+        if retries == task_max and task.status != "completed":
+            task.status = "failed"  # Set failed status to match sync behavior
+            logger.info(f"Task {task_id} failed after {task_max} retries.")
 
     async def arun_all_tasks(self):
         """Async version of run_all_tasks method"""
@@ -1145,12 +1315,61 @@ class AgentTeam:
         if self.variables and not getattr(task, 'variables', None):
             task.variables = self.variables
         
+        # Use per-task max_retries if available
+        task_max = getattr(task, "max_retries", self.max_retries)
         retries = 0
-        while task.status != "completed" and retries < self.max_retries:
+        while task.status != "completed" and retries < task_max:
             logger.debug(f"Attempt {retries+1} for task {task_id}")
             if task.status in ["not started", "in progress"]:
                 task_output = self.execute_task(task_id)
                 if task_output and self.completion_checker(task, task_output.raw):
+                    # Add guardrail validation (matches arun_task logic)
+                    if task._guardrail_fn:
+                        try:
+                            guardrail_result = task._process_guardrail(task_output)
+                            if not guardrail_result.success:
+                                if task.retry_count >= task.max_retries:
+                                    raise Exception(
+                                        f"Task failed guardrail validation after {task.max_retries} retries. "
+                                        f"Last error: {guardrail_result.error}"
+                                    )
+                                task.retry_count += 1
+                                task.status = "in progress"  # Keep task in progress for retry
+                                logger.warning(f"Task {task_id}: Guardrail validation failed (retry {task.retry_count}/{task.max_retries}): {guardrail_result.error}")
+                                retries += 1
+                                continue  # Retry the task
+                            
+                            # If guardrail passed and returned a modified result
+                            if guardrail_result.result is not None:
+                                if isinstance(guardrail_result.result, str):
+                                    # Update the task output with the modified result
+                                    task_output.raw = guardrail_result.result
+                                    # Clear structured fields to avoid stale cache
+                                    if hasattr(task_output, 'json_dict'):
+                                        task_output.json_dict = None
+                                    if hasattr(task_output, 'pydantic'):
+                                        task_output.pydantic = None
+                                    task.result = task_output
+                                elif hasattr(guardrail_result.result, 'raw'):
+                                    # Replace with the new task output
+                                    task_output = guardrail_result.result
+                                    task.result = task_output
+                            
+                            logger.info(f"Task {task_id}: Guardrail validation passed")
+                        except Exception as e:
+                            logger.error(f"Task {task_id}: Error in guardrail processing: {e}")
+                            # Handle guardrail failure with retry logic
+                            if task.retry_count >= task.max_retries:
+                                raise Exception(
+                                    f"Task failed due to guardrail processing error after {task.max_retries} retries. "
+                                    f"Last error: {e}"
+                                ) from e
+                            task.retry_count += 1
+                            task.status = "in progress"
+                            logger.warning(f"Task {task_id}: Guardrail processing error (retry {task.retry_count}/{task.max_retries}): {e}")
+                            retries += 1
+                            continue  # Retry the task
+                    
                     task.status = "completed"
                     # Run execute_callback for memory operations
                     try:
@@ -1164,12 +1383,10 @@ class AgentTeam:
                     if task.callback:
                         try:
                             if asyncio.iscoroutinefunction(task.callback):
-                                try:
-                                    loop = asyncio.get_running_loop()
-                                    loop.create_task(task.callback(task_output))
-                                except RuntimeError:
-                                    # No event loop running, create new one
-                                    asyncio.run(task.callback(task_output))
+                                if run_coroutine_safely:
+                                    run_coroutine_safely(task.callback(task_output))
+                                else:
+                                    logger.warning("run_coroutine_safely not available, skipping async callback")
                             else:
                                 task.callback(task_output)
                         except Exception as e:
@@ -1191,7 +1408,11 @@ class AgentTeam:
                     task.status = "in progress"
                     if self.verbose >= 1:
                         logger.info(f"Task {task_id} not completed, retrying")
-                    time.sleep(1)
+                    # Use task's retry policy instead of hardcoded sleep (with cap)
+                    delay = getattr(task, 'retry_delay', 1)
+                    max_delay = getattr(task, 'max_retry_delay', 300)  # 5 min cap
+                    actual_delay = min(delay * (2 ** retries), max_delay)
+                    time.sleep(actual_delay)
                     retries += 1
             else:
                 if task.status == "failed":
@@ -1201,8 +1422,9 @@ class AgentTeam:
                     logger.info("Invalid Task status")
                     break
 
-        if retries == self.max_retries and task.status != "completed":
-            logger.info(f"Task {task_id} failed after {self.max_retries} retries.")
+        if retries == task_max and task.status != "completed":
+            task.status = "failed"  # Set failed status
+            logger.info(f"Task {task_id} failed after {task_max} retries.")
 
     def run_all_tasks(self):
         """Synchronous version of run_all_tasks method"""
@@ -1325,56 +1547,103 @@ class AgentTeam:
             ))
             console.print()
             
-            # Execute tasks with verbose output
+            # Use callbacks for verbose display while maintaining process orchestration
             total_agents = len(self.agents)
             workflow_start_time = time_module.time()
+            task_times = {}
+            task_idx = {}
             
-            for idx, (task_id, task) in enumerate(self.tasks.items(), 1):
-                agent = task.agent
-                agent_name = agent.display_name if agent else "Unknown"
-                agent_model = getattr(agent, 'llm', 'gpt-4o-mini') if agent else "unknown"
-                
-                # Show agent task panel with model info
-                task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
-                panel_content = f"[bold {PRAISON_COLORS['task_text']}]📋 Task:[/] {task_desc}\n"
-                panel_content += f"[dim]🤖 Model: {agent_model}[/dim]"
-                console.print(Panel.fit(
-                    panel_content,
-                    title=f"[bold]Agent [{idx}/{total_agents}]: {agent_name}[/]",
-                    border_style=PRAISON_COLORS["task"]
-                ))
-                
-                # Execute with timing and status
-                start_time = time_module.time()
-                
-                # Show working spinner
-                with console.status(
-                    f"[bold yellow]Working...[/]  {agent_name} generating response...",
-                    spinner="dots",
-                    spinner_style="yellow"
-                ):
-                    # Run the task
-                    if self.planning:
-                        self._run_with_planning()
-                        break  # Planning mode handles all tasks
-                    else:
-                        self.run_task(task_id)
-                
-                elapsed = time_module.time() - start_time
-                
-                # Show response panel - FULL response, no truncation
-                result = self.get_task_result(task_id)
-                if result:
-                    response_text = str(result.raw)
-                    # No truncation - show full response in verbose mode
-                    from rich.markdown import Markdown
-                    console.print(Panel(
-                        Markdown(response_text),
-                        title=f"[bold]Agent [{idx}/{total_agents}] Complete ({elapsed:.1f}s)[/]",
-                        border_style=PRAISON_COLORS["response"],
-                        padding=(1, 2)
+            # Set up index mapping for tasks
+            for idx, task_id in enumerate(self.tasks.keys(), 1):
+                task_idx[task_id] = idx
+            
+            # Define callbacks to display progress while using proper orchestration
+            def verbose_task_start_callback(task, task_id):
+                try:
+                    agent = task.agent
+                    agent_name = agent.display_name if agent else "Unknown"
+                    agent_model = getattr(agent, 'llm', 'gpt-4o-mini') if agent else "unknown"
+                    idx = task_idx.get(task_id, 0)
+                    
+                    # Show agent task panel with model info
+                    task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
+                    panel_content = f"[bold {PRAISON_COLORS['task_text']}]📋 Task:[/] {task_desc}\n"
+                    panel_content += f"[dim]🤖 Model: {agent_model}[/dim]"
+                    console.print(Panel.fit(
+                        panel_content,
+                        title=f"[bold]Agent [{idx}/{total_agents}]: {agent_name}[/]",
+                        border_style=PRAISON_COLORS["task"]
                     ))
-                console.print()
+                    
+                    # Store start time for this task
+                    task_times[task_id] = time_module.time()
+                    
+                    # Show working spinner
+                    console.print(f"[bold yellow]Working...[/]  {agent_name} generating response...")
+                except Exception as e:
+                    logging.debug(f"Error in verbose task start callback: {e}")
+            
+            def verbose_task_complete_callback(task, task_output):
+                try:
+                    task_id = getattr(task, 'id', 'unknown')
+                    start_time = task_times.get(task_id, time_module.time())
+                    elapsed = time_module.time() - start_time
+                    idx = task_idx.get(task_id, 0)
+                    
+                    # Show response panel - FULL response, no truncation
+                    if task_output:
+                        response_text = str(task_output.raw)
+                        # No truncation - show full response in verbose mode
+                        from rich.markdown import Markdown
+                        console.print(Panel(
+                            Markdown(response_text),
+                            title=f"[bold]Agent [{idx}/{total_agents}] Complete ({elapsed:.1f}s)[/]",
+                            border_style=PRAISON_COLORS["response"],
+                            padding=(1, 2)
+                        ))
+                    console.print()
+                except Exception as e:
+                    logging.debug(f"Error in verbose task complete callback: {e}")
+            
+            # Set callbacks for verbose display (compose with existing callbacks)
+            original_on_task_start = self.on_task_start
+            original_on_task_complete = self.on_task_complete
+            
+            def composed_on_task_start(task):
+                try:
+                    verbose_task_start_callback(task)
+                except Exception as e:
+                    logging.debug(f"Error in verbose task start callback: {e}")
+                if original_on_task_start:
+                    try:
+                        original_on_task_start(task)
+                    except Exception as e:
+                        logging.debug(f"Error in original task start callback: {e}")
+            
+            def composed_on_task_complete(task):
+                try:
+                    verbose_task_complete_callback(task)
+                except Exception as e:
+                    logging.debug(f"Error in verbose task complete callback: {e}")
+                if original_on_task_complete:
+                    try:
+                        original_on_task_complete(task)
+                    except Exception as e:
+                        logging.debug(f"Error in original task complete callback: {e}")
+            
+            self.on_task_start = composed_on_task_start
+            self.on_task_complete = composed_on_task_complete
+            
+            # Use proper process orchestration with verbose callbacks
+            try:
+                if self.planning:
+                    self._run_with_planning()
+                else:
+                    self.run_all_tasks()
+            finally:
+                # Restore original callbacks
+                self.on_task_start = original_on_task_start
+                self.on_task_complete = original_on_task_complete
             
             # Workflow summary panel
             total_elapsed = time_module.time() - workflow_start_time
@@ -1643,7 +1912,7 @@ class AgentTeam:
             None
         """
         if protocol == "http":
-            global _agents_server_started, _agents_registered_endpoints, _agents_shared_apps
+            # Use centralized server registry
             
             if not self.agents:
                 logging.warning("No agents to launch for HTTP mode. Add agents to the Agents instance first.")
@@ -1674,58 +1943,43 @@ class AgentTeam:
                 print("pip install 'praisonaiagents[api]'")
                 return None
             
-            # Thread-safe initialization of port-specific collections
-            with _agents_server_lock:
-                # Initialize port-specific collections if needed
-                if port not in _agents_registered_endpoints:
-                    _agents_registered_endpoints[port] = {}
-                    
-                # Initialize shared FastAPI app if not already created for this port
-                if _agents_shared_apps.get(port) is None:
-                    _agents_shared_apps[port] = FastAPI(
-                        title=f"PraisonAI Agents API (Port {port})",
-                        description="API for interacting with multiple PraisonAI Agents"
-                    )
-                
+            # Thread-safe initialization of FastAPI app
+            app, is_new = _server_registry.get_or_create_app(
+                port, f"PraisonAI Agents API (Port {port})"
+            )
+            
+            if is_new:
                 # Add a root endpoint with a welcome message
-                @_agents_shared_apps[port].get("/")
+                @app.get("/")
                 async def root():
                     return {
                         "message": f"Welcome to PraisonAI Agents API on port {port}. See /docs for usage.",
-                        "endpoints": list(_agents_registered_endpoints[port].keys())
+                        "endpoints": _server_registry.list_routes(port)
                     }
                 
                 # Add healthcheck endpoint
-                @_agents_shared_apps[port].get("/health")
+                @app.get("/health")
                 async def healthcheck():
                     return {
                         "status": "ok", 
-                        "endpoints": list(_agents_registered_endpoints[port].keys())
+                        "endpoints": _server_registry.list_routes(port)
                     }
             
             # Normalize path to ensure it starts with /
             if not path.startswith('/'):
                 path = f'/{path}'
                 
-            # Thread-safe path registration 
-            with _agents_server_lock:
-                # Check if path is already registered for this port
-                if path in _agents_registered_endpoints[port]:
-                    logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
-                    print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
-                    # Use a modified path to avoid conflicts
-                    original_path = path
-                    instance_id = str(uuid.uuid4())[:6]
-                    path = f"{path}_{instance_id}"
-                    logging.warning(f"Using '{path}' instead of '{original_path}'")
-                    print(f"🔄 Using '{path}' instead")
-                
-                # Generate a unique ID for this agent group's endpoint
-                endpoint_id = str(uuid.uuid4())
-                _agents_registered_endpoints[port][path] = endpoint_id
+            # Generate a unique ID for this agent group's endpoint and reserve route atomically
+            endpoint_id = str(uuid.uuid4())
+            path, original_path = _server_registry.reserve_route(port, path, endpoint_id)
+            if original_path is not None:
+                logging.warning(f"Path '{original_path}' is already registered on port {port}. Please use a different path.")
+                print(f"⚠️ Warning: Path '{original_path}' is already registered on port {port}.")
+                logging.warning(f"Using '{path}' instead of '{original_path}'")
+                print(f"🔄 Using '{path}' instead")
             
             # Define the endpoint handler
-            @_agents_shared_apps[port].post(path)
+            @app.post(path)
             async def handle_query(request: Request, query_data: Optional[AgentQuery] = None):
                 # Handle both direct JSON with query field and form data
                 if query_data is None:
@@ -1804,7 +2058,7 @@ class AgentTeam:
             agents_dict = {agent.display_name.lower().replace(' ', '_'): agent for agent in self.agents}
             
             # Add GET endpoint to list available agents
-            @_agents_shared_apps[port].get(f"{path}/list")
+            @app.get(f"{path}/list")
             async def list_agents():
                 return {
                     "agents": [
@@ -1850,45 +2104,19 @@ class AgentTeam:
                             )
                     return handle_single_agent
                 
-                # Register the endpoint with thread safety
-                _agents_shared_apps[port].post(agent_path)(create_agent_handler(agent_instance))
-                with _agents_server_lock:
-                    _agents_registered_endpoints[port][agent_path] = f"{endpoint_id}_{agent_id}"
+                # Register the endpoint
+                app.post(agent_path)(create_agent_handler(agent_instance))
+                _server_registry.register_route(port, agent_path, f"{endpoint_id}_{agent_id}")
             
             print(f"🔗 Per-agent endpoints: {', '.join([f'{path}/{aid}' for aid in agents_dict.keys()])}")
             
             # Start the server if it's not already running for this port
-            with _agents_server_lock:
-                if not _agents_server_started.get(port, False):
-                    # Mark the server as started first to prevent duplicate starts
-                    _agents_server_started[port] = True
-                    should_start_server = True
-                else:
-                    should_start_server = False
-            
-            if should_start_server:
+            if _server_registry.start_server_if_needed(port, host, log_level="debug" if debug else "info"):
+                print(f"✅ FastAPI server started at http://{host}:{port}")
+                print(f"📚 API documentation available at http://{host}:{port}/docs")
                 
-                # Start the server in a separate thread
-                def run_server():
-                    try:
-                        print(f"✅ FastAPI server started at http://{host}:{port}")
-                        print(f"📚 API documentation available at http://{host}:{port}/docs")
-                        print(f"🔌 Registered HTTP endpoints on port {port}: {', '.join(list(_agents_registered_endpoints[port].keys()))}")
-                        uvicorn.run(_agents_shared_apps[port], host=host, port=port, log_level="debug" if debug else "info")
-                    except Exception as e:
-                        logging.error(f"Error starting server: {str(e)}", exc_info=True)
-                        print(f"❌ Error starting server: {str(e)}")
-                
-                # Run server in a background thread
-                server_thread = threading.Thread(target=run_server, daemon=True)
-                server_thread.start()
-                
-                # Wait for a moment to allow the server to start and register endpoints
-                time.sleep(0.5)
-            else:
-                # If server is already running, wait a moment to make sure the endpoint is registered
-                time.sleep(0.1)
-                print(f"🔌 Registered HTTP endpoints on port {port}: {', '.join(list(_agents_registered_endpoints[port].keys()))}")
+            endpoints = _server_registry.list_routes(port)
+            print(f"🔌 Registered HTTP endpoints on port {port}: {', '.join(endpoints)}")
             
             # Get the stack frame to check if this is the last launch() call in the script
             import inspect
@@ -2467,6 +2695,86 @@ class AgentTeam:
         # Restore original tasks reference for result retrieval
         self._plan_tasks = self.tasks.copy()
         # Keep plan tasks for results but note original tasks are preserved in _plan_tasks
+
+    # Resource Lifecycle Management
+    def close(self) -> None:
+        """Close all agent resources and cleanup connections.
+        
+        This method ensures proper cleanup of:
+        - Agent resources (connections, file handles)
+        - Shared memory connections (SQLite, ChromaDB, MongoDB)
+        - Context manager resources
+        """
+        from .._logging import get_logger
+        logger = get_logger(__name__)
+        
+        # Close all agents
+        for agent in self.agents:
+            try:
+                if hasattr(agent, 'close') and callable(agent.close):
+                    agent.close()
+                    logger.debug(f"Closed resources for agent: {agent.name}")
+            except Exception as e:
+                logger.warning(f"Agent {getattr(agent, 'name', 'unknown')} cleanup failed: {e}")
+        
+        # Close shared memory resources
+        if hasattr(self, 'shared_memory') and self.shared_memory:
+            try:
+                if hasattr(self.shared_memory, 'close') and callable(self.shared_memory.close):
+                    self.shared_memory.close()
+                    logger.debug("Closed shared memory resources")
+            except Exception as e:
+                logger.warning(f"Shared memory cleanup failed: {e}")
+        
+        # Close context manager if initialized
+        if hasattr(self, '_context_manager') and self._context_manager:
+            try:
+                if hasattr(self._context_manager, 'close') and callable(self._context_manager.close):
+                    self._context_manager.close()
+                    logger.debug("Closed context manager resources")
+            except Exception as e:
+                logger.warning(f"Context manager cleanup failed: {e}")
+
+    def __enter__(self):
+        """Context manager entry point for resource management."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit point - ensures resource cleanup."""
+        self.close()
+
+    async def __aenter__(self):
+        """Async context manager entry point for resource management."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit point - ensures async resource cleanup."""
+        from .._logging import get_logger
+        logger = get_logger(__name__)
+        
+        # Close all agents async if they support it
+        for agent in self.agents:
+            try:
+                if hasattr(agent, 'aclose') and callable(agent.aclose):
+                    await agent.aclose()
+                    logger.debug(f"Async closed resources for agent: {agent.name}")
+                elif hasattr(agent, 'close') and callable(agent.close):
+                    agent.close()
+                    logger.debug(f"Closed resources for agent: {agent.name}")
+            except Exception as e:
+                logger.warning(f"Agent {getattr(agent, 'name', 'unknown')} async cleanup failed: {e}")
+        
+        # Close shared memory resources (async if supported)
+        if hasattr(self, 'shared_memory') and self.shared_memory:
+            try:
+                if hasattr(self.shared_memory, 'aclose') and callable(self.shared_memory.aclose):
+                    await self.shared_memory.aclose()
+                    logger.debug("Async closed shared memory resources")
+                elif hasattr(self.shared_memory, 'close') and callable(self.shared_memory.close):
+                    self.shared_memory.close()
+                    logger.debug("Closed shared memory resources")
+            except Exception as e:
+                logger.warning(f"Shared memory async cleanup failed: {e}")
 
 # Backward compatibility aliases (silent - no deprecation warnings)
 # AgentTeam is the primary name (v1.0+)

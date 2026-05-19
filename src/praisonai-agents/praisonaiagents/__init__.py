@@ -202,6 +202,13 @@ _LAZY_IMPORTS = {
     'FlowDisplay': ('praisonaiagents.flow_display', 'FlowDisplay'),
     'track_workflow': ('praisonaiagents.flow_display', 'track_workflow'),
     
+    # CLI Backend Protocol (Protocol-driven external CLI integration)
+    'CliBackendProtocol': ('praisonaiagents.cli_backend.protocols', 'CliBackendProtocol'),
+    'CliBackendConfig': ('praisonaiagents.cli_backend.protocols', 'CliBackendConfig'),
+    'CliSessionBinding': ('praisonaiagents.cli_backend.protocols', 'CliSessionBinding'),
+    'CliBackendResult': ('praisonaiagents.cli_backend.protocols', 'CliBackendResult'),
+    'CliBackendDelta': ('praisonaiagents.cli_backend.protocols', 'CliBackendDelta'),
+    
     # Agent classes
     'Agent': ('praisonaiagents.agent.agent', 'Agent'),
     'BudgetExceededError': ('praisonaiagents.errors', 'BudgetExceededError'),
@@ -212,6 +219,7 @@ _LAZY_IMPORTS = {
     'LLMError': ('praisonaiagents.errors', 'LLMError'),
     'ValidationError': ('praisonaiagents.errors', 'ValidationError'),
     'NetworkError': ('praisonaiagents.errors', 'NetworkError'),
+    'PraisonAIConfigError': ('praisonaiagents.errors', 'PraisonAIConfigError'),
     'ErrorContextProtocol': ('praisonaiagents.errors', 'ErrorContextProtocol'),
     'Heartbeat': ('praisonaiagents.agent.heartbeat', 'Heartbeat'),
     'HeartbeatConfig': ('praisonaiagents.agent.heartbeat', 'HeartbeatConfig'),

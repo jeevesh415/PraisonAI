@@ -30,10 +30,163 @@ Usage::
 import asyncio
 import logging
 import os
+import warnings
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable, Dict, Any, Optional, List
+from typing import AsyncIterator, Callable, Dict, Any, Optional, List, Union
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared exceptions
+# ---------------------------------------------------------------------------
+
+class ManagedSandboxRequired(RuntimeError):
+    """Raised when package installation is attempted without proper sandboxing.
+    
+    This exception is raised when `LocalManagedAgent` is configured with packages
+    but no compute provider is specified, creating a security risk where packages
+    would be installed on the host system.
+    
+    To fix this error, either:
+    1. Specify a compute provider: `LocalManagedAgent(compute="docker", ...)`
+    2. Explicitly allow host packages: `LocalManagedConfig(host_packages_ok=True)`
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Typed Configuration Dataclasses
+# ---------------------------------------------------------------------------
+
+class NetworkingType(str, Enum):
+    """Networking configuration type."""
+    UNRESTRICTED = "unrestricted"
+    LIMITED = "limited"
+
+
+@dataclass
+class NetworkingConfig:
+    """Typed networking configuration for environments.
+    
+    Example::
+    
+        # Unrestricted networking
+        net = NetworkingConfig(type=NetworkingType.UNRESTRICTED)
+        
+        # Limited networking
+        net = NetworkingConfig(
+            type=NetworkingType.LIMITED,
+            allowed_hosts=["api.openai.com", "anthropic.com"],
+            allow_mcp_servers=True,
+            allow_package_managers=False
+        )
+    """
+    type: NetworkingType = NetworkingType.UNRESTRICTED
+    allowed_hosts: Optional[List[str]] = None
+    allow_mcp_servers: bool = True
+    allow_package_managers: bool = True
+
+
+@dataclass
+class PackagesConfig:
+    """Typed packages configuration for all 6 supported package managers.
+    
+    Example::
+    
+        pkg = PackagesConfig(
+            pip=["pandas", "numpy"],
+            npm=["express", "lodash"],
+            apt=["curl", "git"],
+            cargo=["serde"],
+            gem=["rails"],
+            go=["github.com/gin-gonic/gin"]
+        )
+    """
+    pip: Optional[List[str]] = None
+    npm: Optional[List[str]] = None
+    apt: Optional[List[str]] = None
+    cargo: Optional[List[str]] = None
+    gem: Optional[List[str]] = None
+    go: Optional[List[str]] = None
+
+    def to_dict(self) -> Dict[str, List[str]]:
+        """Convert to dict format expected by Anthropic API."""
+        result = {}
+        for manager, packages in [
+            ("pip", self.pip),
+            ("npm", self.npm), 
+            ("apt", self.apt),
+            ("cargo", self.cargo),
+            ("gem", self.gem),
+            ("go", self.go),
+        ]:
+            if packages:
+                result[manager] = packages
+        return result
+
+
+class VaultManager:
+    """Manager for Anthropic vault operations (OAuth credentials storage).
+    
+    Wraps the client.beta.vaults API with convenient methods.
+    
+    Example::
+    
+        vault_mgr = VaultManager(client)
+        vault_id = vault_mgr.create("github", {"access_token": "ghp_..."})
+        vaults = vault_mgr.list()
+        vault_mgr.delete(vault_id)
+    """
+    
+    def __init__(self, client: Any):
+        self.client = client
+    
+    def create(self, provider: str, credentials: Dict[str, str], name: Optional[str] = None) -> str:
+        """Create a new vault with OAuth credentials.
+        
+        Args:
+            provider: OAuth provider (e.g. "github", "slack")
+            credentials: Credential dict (e.g. {"access_token": "..."})
+            name: Optional vault name
+            
+        Returns:
+            Vault ID
+        """
+        kwargs = {"provider": provider, "credentials": credentials}
+        if name:
+            kwargs["name"] = name
+        vault = self.client.beta.vaults.create(**kwargs)
+        return vault.id
+    
+    def list(self, **kwargs) -> List[Dict[str, Any]]:
+        """List all vaults."""
+        vaults = self.client.beta.vaults.list(**kwargs)
+        result = []
+        for v in getattr(vaults, "data", vaults):
+            result.append({
+                "id": getattr(v, "id", None),
+                "provider": getattr(v, "provider", None),
+                "name": getattr(v, "name", None),
+                "created_at": getattr(v, "created_at", None),
+            })
+        return result
+    
+    def retrieve(self, vault_id: str) -> Dict[str, Any]:
+        """Retrieve vault metadata (credentials not exposed)."""
+        vault = self.client.beta.vaults.retrieve(vault_id)
+        return {
+            "id": getattr(vault, "id", None),
+            "provider": getattr(vault, "provider", None),
+            "name": getattr(vault, "name", None),
+            "created_at": getattr(vault, "created_at", None),
+            "updated_at": getattr(vault, "updated_at", None),
+        }
+    
+    def delete(self, vault_id: str) -> None:
+        """Delete a vault permanently."""
+        self.client.beta.vaults.delete(vault_id)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +217,7 @@ class ManagedConfig:
     name: str = "Agent"
     model: str = "claude-haiku-4-5"
     system: str = "You are a helpful coding assistant."
+    description: str = ""  # Added missing field
     tools: List[Dict[str, Any]] = field(default_factory=lambda: [{"type": "agent_toolset_20260401"}])
     mcp_servers: List[Dict[str, Any]] = field(default_factory=list)
     skills: List[Dict[str, Any]] = field(default_factory=list)
@@ -72,8 +226,8 @@ class ManagedConfig:
 
     # ── Environment fields ──
     env_name: str = "praisonai-env"
-    packages: Optional[Dict[str, List[str]]] = None
-    networking: Dict[str, Any] = field(default_factory=lambda: {"type": "unrestricted"})
+    packages: Optional[Union[Dict[str, List[str]], PackagesConfig]] = None
+    networking: Union[Dict[str, Any], NetworkingConfig] = field(default_factory=lambda: NetworkingConfig())
 
     # ── Session fields ──
     session_title: str = "PraisonAI session"
@@ -126,9 +280,9 @@ class AnthropicManagedAgent:
 
         # Accept ManagedConfig dataclass *or* plain dict
         if config is not None and not isinstance(config, dict):
-            # Assume dataclass — convert to dict
-            from dataclasses import asdict
-            self._cfg = asdict(config)
+            # Assume dataclass — preserve nested typed configs; serialize later
+            from dataclasses import fields
+            self._cfg = {f.name: getattr(config, f.name) for f in fields(config)}
         else:
             self._cfg: Dict[str, Any] = config or {}
 
@@ -142,6 +296,9 @@ class AnthropicManagedAgent:
         # Usage tracking (accumulated per instance)
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        
+        # Lazy-initialized managers
+        self._vault_manager: Optional[VaultManager] = None
 
     # ------------------------------------------------------------------
     # Client
@@ -166,6 +323,14 @@ class AnthropicManagedAgent:
                 timeout=self.timeout,
             )
         return self._client
+    
+    @property
+    def vaults(self) -> VaultManager:
+        """Lazy-initialized vault manager for OAuth credentials."""
+        if self._vault_manager is None:
+            client = self._get_client()
+            self._vault_manager = VaultManager(client)
+        return self._vault_manager
 
     # ------------------------------------------------------------------
     # Agent
@@ -184,6 +349,9 @@ class AnthropicManagedAgent:
             "system": c.get("system", self.instructions),
             "tools": c.get("tools", [{"type": "agent_toolset_20260401"}]),
         }
+        # Optional description field
+        if c.get("description"):
+            kwargs["description"] = c["description"]
         # Optional fields — only send if non-empty
         if c.get("mcp_servers"):
             kwargs["mcp_servers"] = c["mcp_servers"]
@@ -203,6 +371,71 @@ class AnthropicManagedAgent:
         return self.agent_id
 
     # ------------------------------------------------------------------
+    # Additional Agent API methods (fill gaps)
+    # ------------------------------------------------------------------
+    def retrieve_agent(self) -> Dict[str, Any]:
+        """Retrieve agent definition and metadata."""
+        if not self.agent_id:
+            return {}
+        client = self._get_client()
+        agent = client.beta.agents.retrieve(self.agent_id)
+        return {
+            "id": getattr(agent, "id", None),
+            "name": getattr(agent, "name", None),
+            "model": getattr(agent, "model", None),
+            "system": getattr(agent, "system", None),
+            "version": getattr(agent, "version", None),
+            "created_at": getattr(agent, "created_at", None),
+            "updated_at": getattr(agent, "updated_at", None),
+        }
+
+    def list_agents(self, **kwargs) -> List[Dict[str, Any]]:
+        """List all agents."""
+        client = self._get_client()
+        params: Dict[str, Any] = {}
+        if "limit" in kwargs:
+            params["limit"] = kwargs["limit"]
+        agents = client.beta.agents.list(**params)
+        result: List[Dict[str, Any]] = []
+        for a in getattr(agents, "data", agents):
+            result.append({
+                "id": getattr(a, "id", None),
+                "name": getattr(a, "name", None),
+                "model": getattr(a, "model", None),
+                "version": getattr(a, "version", None),
+                "created_at": getattr(a, "created_at", None),
+            })
+        return result
+
+    def archive_agent(self) -> None:
+        """Archive the current agent."""
+        if not self.agent_id:
+            logger.warning("[managed] archive_agent called but no agent exists")
+            return
+        client = self._get_client()
+        archived_id = self.agent_id
+        client.beta.agents.archive(self.agent_id)
+        # Clear cached state immediately after successful archive
+        self.agent_id = None
+        self.agent_version = None
+        self._session_id = None
+        logger.info("[managed] agent archived: %s", archived_id)
+
+    def list_agent_versions(self) -> List[Dict[str, Any]]:
+        """List all versions of the current agent."""
+        if not self.agent_id:
+            return []
+        client = self._get_client()
+        versions = client.beta.agents.versions.list(self.agent_id)
+        result: List[Dict[str, Any]] = []
+        for v in getattr(versions, "data", versions):
+            result.append({
+                "version": getattr(v, "version", None),
+                "created_at": getattr(v, "created_at", None),
+            })
+        return result
+
+    # ------------------------------------------------------------------
     # Environment
     # ------------------------------------------------------------------
     def _ensure_environment(self) -> str:
@@ -213,12 +446,34 @@ class AnthropicManagedAgent:
         client = self._get_client()
         c = self._cfg
 
+        # Handle typed networking config
+        networking = c.get("networking", NetworkingConfig())
+        if isinstance(networking, NetworkingConfig):
+            networking_dict = {
+                "type": networking.type.value,
+            }
+            if networking.type == NetworkingType.LIMITED:
+                if networking.allowed_hosts:
+                    networking_dict["allowed_hosts"] = networking.allowed_hosts
+                if networking.allow_mcp_servers is not None:
+                    networking_dict["allow_mcp_servers"] = networking.allow_mcp_servers
+                if networking.allow_package_managers is not None:
+                    networking_dict["allow_package_managers"] = networking.allow_package_managers
+        else:
+            networking_dict = networking
+
         env_config: Dict[str, Any] = {
             "type": "cloud",
-            "networking": c.get("networking", {"type": "unrestricted"}),
+            "networking": networking_dict,
         }
-        if c.get("packages"):
-            env_config["packages"] = c["packages"]
+
+        # Handle typed packages config  
+        packages = c.get("packages")
+        if packages:
+            if isinstance(packages, PackagesConfig):
+                env_config["packages"] = packages.to_dict()
+            else:
+                env_config["packages"] = packages
 
         environment = client.beta.environments.create(
             name=c.get("env_name", "praisonai-env"),
@@ -227,6 +482,63 @@ class AnthropicManagedAgent:
         self.environment_id = environment.id
         logger.info("[managed] environment created: %s", environment.id)
         return self.environment_id
+
+    # ------------------------------------------------------------------
+    # Additional Environment API methods (fill gaps)
+    # ------------------------------------------------------------------
+    def retrieve_environment(self) -> Dict[str, Any]:
+        """Retrieve environment definition and metadata."""
+        if not self.environment_id:
+            return {}
+        client = self._get_client()
+        env = client.beta.environments.retrieve(self.environment_id)
+        return {
+            "id": getattr(env, "id", None),
+            "name": getattr(env, "name", None),
+            "config": getattr(env, "config", None),
+            "created_at": getattr(env, "created_at", None),
+            "updated_at": getattr(env, "updated_at", None),
+        }
+
+    def list_environments(self, **kwargs) -> List[Dict[str, Any]]:
+        """List all environments."""
+        client = self._get_client()
+        params: Dict[str, Any] = {}
+        if "limit" in kwargs:
+            params["limit"] = kwargs["limit"]
+        environments = client.beta.environments.list(**params)
+        result: List[Dict[str, Any]] = []
+        for e in getattr(environments, "data", environments):
+            result.append({
+                "id": getattr(e, "id", None),
+                "name": getattr(e, "name", None),
+                "created_at": getattr(e, "created_at", None),
+            })
+        return result
+
+    def archive_environment(self) -> None:
+        """Archive the current environment."""
+        if not self.environment_id:
+            logger.warning("[managed] archive_environment called but no environment exists")
+            return
+        client = self._get_client()
+        archived_id = self.environment_id
+        client.beta.environments.archive(self.environment_id)
+        # Clear cached state
+        self.environment_id = None
+        self._session_id = None
+        logger.info("[managed] environment archived: %s", archived_id)
+
+    def delete_environment(self) -> None:
+        """Delete the current environment."""
+        if not self.environment_id:
+            logger.warning("[managed] delete_environment called but no environment exists")
+            return
+        client = self._get_client()
+        client.beta.environments.delete(self.environment_id)
+        logger.info("[managed] environment deleted: %s", self.environment_id)
+        self.environment_id = None
+        self._session_id = None
 
     # ------------------------------------------------------------------
     # Session
@@ -241,8 +553,17 @@ class AnthropicManagedAgent:
         env_id = self._ensure_environment()
         c = self._cfg
 
+        # Support agent version pinning
+        agent_ref = agent_id
+        if self.agent_version is not None:
+            agent_ref = {
+                "type": "agent",
+                "id": agent_id,
+                "version": self.agent_version
+            }
+
         kwargs: Dict[str, Any] = {
-            "agent": agent_id,
+            "agent": agent_ref,
             "environment_id": env_id,
             "title": c.get("session_title", "PraisonAI session"),
         }
@@ -259,7 +580,7 @@ class AnthropicManagedAgent:
     # ------------------------------------------------------------------
     # Event processing helpers
     # ------------------------------------------------------------------
-    def _process_events(self, client, session_id, stream, *, collect: bool = True, stream_live: bool = False):
+    def _process_events(self, client, session_id, stream, *, collect: bool = True, stream_live: bool = False, emitter=None):
         """Walk the SSE stream and return (text_parts, tool_log).
 
         Handles:
@@ -272,11 +593,14 @@ class AnthropicManagedAgent:
 
         Args:
             stream_live: If True, print text chunks to stdout as they arrive.
+            emitter: ContextTraceEmitter for trace events.
         """
         import sys as _sys
+        import time
 
         text_parts: List[str] = []
         tool_log: List[str] = []
+        tool_start_times = {}  # Track tool start times for duration calculation
 
         for event in stream:
             etype = getattr(event, "type", None)
@@ -292,11 +616,20 @@ class AnthropicManagedAgent:
 
             elif etype == "agent.tool_use":
                 name = getattr(event, "name", "unknown")
+                tool_id = getattr(event, "id", "")
+                tool_input = getattr(event, "input", {})
+                
                 tool_log.append(name)
                 logger.debug("[managed] tool_use: %s", name)
                 if stream_live:
                     _sys.stdout.write(f"\n[Using tool: {name}]\n")
                     _sys.stdout.flush()
+
+                # Emit tool_call_start event
+                if emitter:
+                    agent_name = self._cfg.get("name", "Agent")
+                    emitter.tool_call_start(agent_name, name, tool_input)
+                    tool_start_times[tool_id] = time.time()
 
                 # Handle tool confirmation (always_ask policy)
                 if getattr(event, "needs_confirmation", False):
@@ -304,8 +637,8 @@ class AnthropicManagedAgent:
                     if self.on_tool_confirmation:
                         info = {
                             "name": name,
-                            "input": getattr(event, "input", {}),
-                            "tool_use_id": getattr(event, "id", None),
+                            "input": tool_input,
+                            "tool_use_id": tool_id,
                         }
                         approved = self.on_tool_confirmation(info)
                     # Send confirmation back
@@ -313,10 +646,18 @@ class AnthropicManagedAgent:
                         session_id,
                         events=[{
                             "type": "user.tool_confirmation",
-                            "tool_use_id": getattr(event, "id", ""),
+                            "tool_use_id": tool_id,
                             "allowed": approved,
                         }],
                     )
+
+                # Emit synthetic tool_call_end since Anthropic doesn't provide a direct end event
+                # We emit this immediately after the tool_use event for now
+                if emitter and tool_id in tool_start_times:
+                    duration_ms = (time.time() - tool_start_times[tool_id]) * 1000
+                    agent_name = self._cfg.get("name", "Agent")
+                    emitter.tool_call_end(agent_name, name, duration_ms=duration_ms)
+                    del tool_start_times[tool_id]
 
             elif etype == "agent.custom_tool_use":
                 tool_name = getattr(event, "name", "custom_tool")
@@ -355,8 +696,12 @@ class AnthropicManagedAgent:
             # Usage tracking (from event.usage or span.model_usage)
             usage = getattr(event, "usage", None) or getattr(event, "model_usage", None)
             if usage:
-                self.total_input_tokens += getattr(usage, "input_tokens", 0)
-                self.total_output_tokens += getattr(usage, "output_tokens", 0)
+                in_t = getattr(usage, "input_tokens", 0)
+                out_t = getattr(usage, "output_tokens", 0)
+                if isinstance(in_t, int):
+                    self.total_input_tokens += in_t
+                if isinstance(out_t, int):
+                    self.total_output_tokens += out_t
 
         if tool_log:
             logger.info("[managed] tools used: %s", tool_log)
@@ -382,28 +727,60 @@ class AnthropicManagedAgent:
                          (token-by-token streaming). The full text is still returned.
         """
         import sys
+        
+        # Get context emitter (zero-overhead when no emitter is installed)
+        try:
+            from praisonaiagents.trace.context_events import get_context_emitter
+            emitter = get_context_emitter()
+        except ImportError:
+            emitter = None
 
         client = self._get_client()
         session_id = self._ensure_session()
+        agent_name = self._cfg.get("name", "Agent")
 
-        with client.beta.sessions.events.stream(session_id) as stream:
-            client.beta.sessions.events.send(
-                session_id,
-                events=[{
-                    "type": "user.message",
-                    "content": [{"type": "text", "text": prompt}],
-                }],
-            )
-            text_parts, _ = self._process_events(
-                client, session_id, stream, collect=True,
-                stream_live=stream_live,
-            )
+        # Emit agent_start event
+        if emitter:
+            emitter.agent_start(agent_name, {
+                "input": prompt,
+                "goal": self._cfg.get("system", self.instructions)
+            })
 
-        if stream_live:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        try:
+            with client.beta.sessions.events.stream(session_id) as stream:
+                client.beta.sessions.events.send(
+                    session_id,
+                    events=[{
+                        "type": "user.message",
+                        "content": [{"type": "text", "text": prompt}],
+                    }],
+                )
+                text_parts, _ = self._process_events(
+                    client, session_id, stream, collect=True,
+                    stream_live=stream_live, emitter=emitter,
+                )
 
-        return "".join(text_parts)
+            if stream_live:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+            full_response = "".join(text_parts)
+            
+            # Emit llm_response event for aggregated text
+            if emitter and full_response:
+                emitter.llm_response(
+                    agent_name, 
+                    response_content=full_response,
+                    prompt_tokens=self.total_input_tokens,
+                    completion_tokens=self.total_output_tokens
+                )
+
+            return full_response
+        
+        finally:
+            # Emit agent_end event
+            if emitter:
+                emitter.agent_end(agent_name)
 
     # ------------------------------------------------------------------
     # stream() — ManagedBackendProtocol
@@ -463,6 +840,7 @@ class AnthropicManagedAgent:
         self.environment_id = None
         self._session_id = None
         self._client = None
+        self._vault_manager = None
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
@@ -509,22 +887,38 @@ class AnthropicManagedAgent:
     # retrieve_session — ManagedBackendProtocol
     # ------------------------------------------------------------------
     def retrieve_session(self) -> Dict[str, Any]:
-        """Retrieve current session metadata and usage from the API."""
+        """Retrieve current session metadata and usage from the API.
+        
+        Returns unified SessionInfo schema with all fields always present:
+        - id: Session ID
+        - status: Session status (idle, running, error, etc.)
+        - title: Session title/name
+        - usage: Token usage with input_tokens and output_tokens
+        """
+        from ._session_info import SessionInfo
+        
         if not self._session_id:
-            return {}
+            return SessionInfo().to_dict()
+        
         client = self._get_client()
         sess = client.beta.sessions.retrieve(self._session_id)
-        result: Dict[str, Any] = {
-            "id": getattr(sess, "id", self._session_id),
-            "status": getattr(sess, "status", None),
-        }
+        
+        # Extract usage information
         usage = getattr(sess, "usage", None)
+        usage_dict = {}
         if usage:
-            result["usage"] = {
+            usage_dict = {
                 "input_tokens": getattr(usage, "input_tokens", 0),
                 "output_tokens": getattr(usage, "output_tokens", 0),
             }
-        return result
+        
+        session_info = SessionInfo(
+            id=getattr(sess, "id", None) or self._session_id or "",
+            status=getattr(sess, "status", None) or "unknown",
+            title=getattr(sess, "title", None) or "",
+            usage=usage_dict if usage_dict else None,
+        )
+        return session_info.to_dict()
 
     # ------------------------------------------------------------------
     # list_sessions — ManagedBackendProtocol
@@ -546,6 +940,33 @@ class AnthropicManagedAgent:
                 "title": getattr(s, "title", None),
             })
         return result
+
+    # ------------------------------------------------------------------
+    # Additional Session API methods (fill gaps)
+    # ------------------------------------------------------------------
+    def archive_session(self, session_id: Optional[str] = None) -> None:
+        """Archive a session (current session if not specified)."""
+        target_id = session_id or self._session_id
+        if not target_id:
+            logger.warning("[managed] archive_session called but no session specified")
+            return
+        client = self._get_client()
+        client.beta.sessions.archive(target_id)
+        logger.info("[managed] session archived: %s", target_id)
+        if target_id == self._session_id:
+            self._session_id = None
+
+    def delete_session(self, session_id: Optional[str] = None) -> None:
+        """Delete a session permanently (current session if not specified)."""
+        target_id = session_id or self._session_id
+        if not target_id:
+            logger.warning("[managed] delete_session called but no session specified")
+            return
+        client = self._get_client()
+        client.beta.sessions.delete(target_id)
+        logger.info("[managed] session deleted: %s", target_id)
+        if target_id == self._session_id:
+            self._session_id = None
 
     # ------------------------------------------------------------------
     # Session resume — attach to a known Anthropic session ID
@@ -639,21 +1060,12 @@ class AnthropicManagedAgent:
 # ---------------------------------------------------------------------------
 # Tool mapping helpers
 # ---------------------------------------------------------------------------
-TOOL_MAPPING = {
-    "bash": "execute_command",
-    "read": "read_file",
-    "write": "write_file",
-    "edit": "apply_diff",
-    "glob": "list_files",
-    "grep": "search_file",
-    "web_fetch": "web_fetch",
-    "search": "search_web",
-}
+from ._tool_aliases import TOOL_ALIAS_MAP
 
 
 def map_managed_tools(managed_tools: List[str]) -> List[str]:
     """Map managed agent tool names to PraisonAI tool names."""
-    return [TOOL_MAPPING.get(tool, tool) for tool in managed_tools]
+    return [TOOL_ALIAS_MAP.get(tool, tool) for tool in managed_tools]
 
 
 # ---------------------------------------------------------------------------
@@ -663,48 +1075,72 @@ def ManagedAgent(
     provider: Optional[str] = None,
     **kwargs,
 ):
-    """Factory that returns the appropriate managed agent backend.
-
-    Provider auto-detection:
-        - ``ANTHROPIC_API_KEY`` set → ``AnthropicManagedAgent``
-        - Otherwise → ``LocalManagedAgent``
-
-    Explicit providers:
-        - ``"anthropic"`` → ``AnthropicManagedAgent``
-        - ``"local"``     → ``LocalManagedAgent`` (any LLM via litellm)
-        - ``"openai"``    → ``LocalManagedAgent`` with OpenAI model
-        - ``"ollama"``    → ``LocalManagedAgent`` with Ollama prefix
-        - ``"gemini"``    → ``LocalManagedAgent`` with Gemini prefix
-
-    Examples::
-
-        # Auto-detect (Anthropic if key set, local otherwise)
-        managed = ManagedAgent()
-
-        # Explicit Anthropic
-        managed = ManagedAgent(provider="anthropic", config=ManagedConfig(...))
-
-        # Explicit local with OpenAI
-        managed = ManagedAgent(provider="openai", config=LocalManagedConfig(model="gpt-4o"))
-
-        # Ollama
-        managed = ManagedAgent(provider="ollama", config=LocalManagedConfig(model="llama3"))
-
+    """Deprecated factory. Use HostedAgent or LocalAgent explicitly.
+    
+    DEPRECATION NOTICE: This factory conflates hosted-runtime vs LLM-routing.
+    
+    New canonical usage:
+    - For hosted runtimes: HostedAgent(provider="anthropic", ...)  
+    - For local loops: LocalAgent(config=LocalAgentConfig(model="gpt-4o-mini"), ...)
+    
+    Legacy behavior (deprecated):
+    - provider="anthropic" → HostedAgent(provider="anthropic", ...)
+    - provider in {"openai","gemini","ollama","local"} → LocalAgent(...)
+      (DeprecationWarning: "use LocalAgent directly; put LLM name in model=")
+    - provider in {"e2b","modal","flyio","daytona","docker"} → raise ValueError
+      ("Cloud compute belongs on LocalAgent(compute=...). Hosted runtimes for
+       these providers are not yet available.")
+    
     Returns:
         An instance satisfying ``ManagedBackendProtocol``.
+        
+    Raises:
+        ValueError: For compute-provider names that should use LocalAgent(compute=).
     """
-    if provider is None:
+    # Track if provider was auto-detected to avoid spurious deprecation warnings
+    auto_detected = provider is None
+    if auto_detected:
         # Auto-detect
         if os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY"):
             provider = "anthropic"
         else:
             provider = "local"
 
+    # Hosted runtime provider
     if provider == "anthropic":
         return AnthropicManagedAgent(provider=provider, **kwargs)
-    else:
+    
+    # Compute provider names - maintain backward compatibility by passing to LocalManagedAgent
+    elif provider in {"e2b", "modal", "flyio", "daytona", "docker"}:
+        warnings.warn(
+            f"ManagedAgent(provider='{provider}') for compute providers is deprecated. "
+            f"Use LocalAgent(compute='{provider}', config=LocalAgentConfig(...)) instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .managed_local import LocalManagedAgent
+        return LocalManagedAgent(provider="local", compute=provider, **kwargs)
+    
+    # LLM routing hints (deprecated usage) - only warn if explicitly passed by user
+    elif provider in {"openai", "gemini", "ollama", "local"}:
+        if not auto_detected:
+            warnings.warn(
+                f"ManagedAgent(provider='{provider}') is deprecated. "
+                f"Use LocalAgent directly with model= instead: "
+                f"LocalAgent(config=LocalAgentConfig(model='gpt-4o-mini'))",
+                DeprecationWarning,
+                stacklevel=2
+            )
         from .managed_local import LocalManagedAgent
         return LocalManagedAgent(provider=provider, **kwargs)
+    
+    # Unknown provider
+    else:
+        raise ValueError(
+            f"Unknown provider '{provider}'. "
+            f"Supported: 'anthropic' for hosted runtime, "
+            f"or use LocalAgent(config=LocalAgentConfig(model='your-model')) for local execution."
+        )
 
 
 # ── Backward-compatible aliases ──

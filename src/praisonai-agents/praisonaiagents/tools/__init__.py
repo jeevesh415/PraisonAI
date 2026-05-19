@@ -10,7 +10,7 @@ _tools_lazy_cache = {}
 # Export core tool items for organized imports (lightweight)
 from .base import BaseTool, ToolResult, ToolValidationError, validate_tool
 from .decorator import tool, FunctionTool
-from .registry import get_registry, register_tool, get_tool, add_tool, has_tool, remove_tool, list_tools, ToolRegistry
+from .registry import get_registry, register_tool, get_tool, add_tool, has_tool, remove_tool, list_tools, list_available_tools, ToolRegistry
 from .tools import Tools
 
 # Export Injected type directly for easy access
@@ -75,12 +75,12 @@ TOOL_MAPPINGS = {
 
 
     # Python Tools
-    'execute_code': ('.python_tools', 'PythonTools'),
-    'analyze_code': ('.python_tools', 'PythonTools'),
-    'format_code': ('.python_tools', 'PythonTools'),
-    'lint_code': ('.python_tools', 'PythonTools'),
-    'disassemble_code': ('.python_tools', 'PythonTools'),
-    'python_tools': ('.python_tools', 'PythonTools'),
+    'execute_code': ('.python_tools', None),
+    'analyze_code': ('.python_tools', None),
+    'format_code': ('.python_tools', None),
+    'lint_code': ('.python_tools', None),
+    'disassemble_code': ('.python_tools', None),
+    'python_tools': ('.python_tools', None),
 
 
     # Chain of Thought Training Tools
@@ -204,6 +204,13 @@ TOOL_MAPPINGS = {
     'smtp_send_email': ('.email_tools', None),
     'smtp_read_inbox': ('.email_tools', None),
     'email_tools': ('.email_tools', None),
+    
+    # Clarify tool
+    'clarify': ('.clarify', None),  # Direct import of clarify instance
+    'ClarifyTool': ('.clarify', 'ClarifyTool'),
+    'ClarifyHandler': ('.clarify', 'ClarifyHandler'),
+    'create_cli_clarify_handler': ('.clarify', 'create_cli_clarify_handler'),
+    'create_bot_clarify_handler': ('.clarify', 'create_bot_clarify_handler'),
 }
 
 # Tool factory functions - caches classes but creates fresh instances
@@ -311,13 +318,15 @@ def __getattr__(name: str) -> Any:
         module = import_module(module_path, __package__)
         return getattr(module, class_name)
     
+    # Remove the special case since it's now handled by None class_name
+    
     if class_name is None:
         # Direct function import
         module = import_module(module_path, __package__)
         if name in [
             'duckduckgo', 'internet_search', 'searxng_search', 'searxng',
             'scrape_page', 'extract_links', 'crawl', 'extract_text',
-            'execute_command', 'list_processes', 'kill_process', 'get_system_info',
+            'execute_command', 'execute_code', 'analyze_code', 'format_code', 'lint_code', 'disassemble_code', 'list_processes', 'kill_process', 'get_system_info',
             'tavily', 'tavily_search', 'tavily_extract', 'tavily_crawl', 'tavily_map',
             'tavily_search_async', 'tavily_extract_async',
             'ydc', 'ydc_search', 'ydc_contents', 'ydc_news', 'ydc_images',
@@ -334,7 +343,9 @@ def __getattr__(name: str) -> Any:
             'store_memory', 'search_memory',
             'store_learning', 'search_learning',
             'send_email', 'list_emails', 'read_email', 'reply_email', 'list_inboxes', 'create_inbox',
-            'smtp_send_email', 'smtp_read_inbox'
+            'smtp_send_email', 'smtp_read_inbox',
+            'create_cli_clarify_handler', 'create_bot_clarify_handler',
+            'clarify'
         ]:
             return getattr(module, name)
         if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'schedule_tools', 'ast_grep_tools', 'email_tools']:
@@ -351,7 +362,8 @@ __all__ = list(TOOL_MAPPINGS.keys()) + [
     'Injected', 'AgentState',
     'BaseTool', 'ToolResult', 'ToolValidationError', 'validate_tool',
     'tool', 'FunctionTool',
-    'get_registry', 'register_tool', 'get_tool', 'add_tool', 'has_tool', 'remove_tool', 'list_tools', 'ToolRegistry',
+    'get_registry', 'register_tool', 'get_tool', 'add_tool', 'has_tool', 'remove_tool', 
+    'list_tools', 'list_available_tools', 'ToolRegistry',
     'Tools',
     # Validation and retry protocols
     'ValidationResult', 'ToolValidatorProtocol', 'AsyncToolValidatorProtocol', 'PassthroughValidator',

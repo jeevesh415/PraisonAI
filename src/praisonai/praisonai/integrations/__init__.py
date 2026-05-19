@@ -29,6 +29,7 @@ Usage:
 # Lazy imports to avoid performance impact
 __all__ = [
     'BaseCLIIntegration',
+    'CLIExecutionError',
     'ClaudeCodeIntegration',
     'GeminiCLIIntegration',
     'CodexCLIIntegration',
@@ -36,11 +37,22 @@ __all__ = [
     'ManagedAgent',
     'ManagedConfig',
     'AnthropicManagedAgent',
-    'LocalManagedAgent',
-    'LocalManagedConfig',
-    'ManagedAgentIntegration',  # backward compat alias
-    'ManagedBackendConfig',     # backward compat alias
+    'LocalManagedAgent',           # backward compat alias
+    'LocalManagedConfig',          # backward compat alias
+    'SandboxedAgent',              # new honest name
+    'SandboxedAgentConfig',        # new honest name
+    'ManagedAgentIntegration',     # backward compat alias
+    'ManagedBackendConfig',        # backward compat alias
+    # New canonical agent backends
+    'HostedAgent',
+    'HostedAgentConfig', 
+    'LocalAgent',
+    'LocalAgentConfig',
     'get_available_integrations',
+    'ExternalAgentRegistry',
+    'get_registry',
+    'register_integration',
+    'create_integration',
 ]
 
 
@@ -49,6 +61,9 @@ def __getattr__(name):
     if name == 'BaseCLIIntegration':
         from .base import BaseCLIIntegration
         return BaseCLIIntegration
+    elif name == 'CLIExecutionError':
+        from .base import CLIExecutionError
+        return CLIExecutionError
     elif name == 'ClaudeCodeIntegration':
         from .claude_code import ClaudeCodeIntegration
         return ClaudeCodeIntegration
@@ -73,10 +88,41 @@ def __getattr__(name):
     elif name == 'LocalManagedConfig':
         from .managed_local import LocalManagedConfig
         return LocalManagedConfig
+    elif name == 'SandboxedAgent':
+        from .sandboxed_agent import SandboxedAgent
+        return SandboxedAgent
+    elif name == 'SandboxedAgentConfig':
+        from .sandboxed_agent import SandboxedAgentConfig
+        return SandboxedAgentConfig
     elif name in ('ManagedConfig', 'ManagedBackendConfig'):
         from .managed_agents import ManagedConfig
         return ManagedConfig
     elif name == 'get_available_integrations':
         from .base import get_available_integrations
         return get_available_integrations
+    elif name == 'ExternalAgentRegistry':
+        from .registry import ExternalAgentRegistry
+        return ExternalAgentRegistry
+    elif name == 'get_registry':
+        from .registry import get_registry
+        return get_registry
+    elif name == 'register_integration':
+        from .registry import register_integration
+        return register_integration
+    elif name == 'create_integration':
+        from .registry import create_integration
+        return create_integration
+    # New canonical agent backends
+    elif name == 'HostedAgent':
+        from .hosted_agent import HostedAgent
+        return HostedAgent
+    elif name == 'HostedAgentConfig':
+        from .hosted_agent import HostedAgentConfig
+        return HostedAgentConfig
+    elif name == 'LocalAgent':
+        from .local_agent import LocalAgent
+        return LocalAgent
+    elif name == 'LocalAgentConfig':
+        from .local_agent import LocalAgentConfig
+        return LocalAgentConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

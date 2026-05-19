@@ -5,12 +5,10 @@ Contains all methods for run/start/launch lifecycle, planning,
 and server endpoints. Extracted from agent.py for maintainability.
 """
 
-import os
 import time
 import json
 import logging
 import inspect
-from praisonaiagents._logging import get_logger
 
 import asyncio
 import threading
@@ -126,7 +124,7 @@ class ExecutionMixin:
             config=HandoffConfig(context_policy=ContextPolicy.NONE),
         )
 
-    async def arun(self, prompt: str, **kwargs):
+    async def arun(self, prompt: str, **kwargs) -> Optional[str]:
         """Async version of run() - silent, non-streaming, returns structured result.
         
         Production-friendly async execution. Does not stream or display output.
@@ -309,8 +307,8 @@ class ExecutionMixin:
         # ── Chat history & session linkage ──
         # Record prompt+response in chat_history so SessionStore/auto_save works
         if result is not None:
-            self.chat_history.append({"role": "user", "content": prompt})
-            self.chat_history.append({"role": "assistant", "content": str(result)})
+            self._append_to_chat_history({"role": "user", "content": prompt})
+            self._append_to_chat_history({"role": "assistant", "content": str(result)})
             # Link managed session ID into SessionStore gateway_session_id
             if hasattr(self.backend, 'managed_session_id'):
                 msid = self.backend.managed_session_id
@@ -319,8 +317,14 @@ class ExecutionMixin:
                         sid = getattr(self, 'auto_save', None) or getattr(self, '_session_id', None)
                         if sid and hasattr(self._session_store, 'set_gateway_info'):
                             self._session_store.set_gateway_info(sid, gateway_session_id=msid)
-                    except Exception:
-                        pass  # Best-effort linkage
+                    except Exception as e:
+                        # Log session linkage failures for debugging
+                        logger.warning(
+                            "Session gateway linkage failed: %s",
+                            e,
+                            extra={"session_id": sid, "managed_session_id": msid},
+                            exc_info=True,
+                        )
             self._auto_save_session()
         
         return result
@@ -942,7 +946,7 @@ Write the complete compiled report:"""
         task_id = getattr(task, 'id', None)
         return await self.achat(prompt, task_name=task_name, task_description=task_description, task_id=task_id)
 
-    async def execute_tool_async(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None) -> Any:
+    async def execute_tool_async(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
         """Async version of execute_tool"""
         try:
             logging.info(f"Executing async tool: {function_name} with arguments: {arguments}")
@@ -958,9 +962,10 @@ Write the complete compiled report:"""
                 logging.error(error_msg)
                 return {"error": error_msg, "approval_error": True}
             
-            # Try to find the function in the agent's tools list first
+            # Try to find the function in the override tools list first, then agent's tools list
             func = None
-            for tool in self.tools:
+            tools_to_search = tools_override if tools_override is not None else self.tools
+            for tool in tools_to_search:
                 if (callable(tool) and getattr(tool, '__name__', '') == function_name):
                     func = tool
                     break

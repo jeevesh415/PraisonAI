@@ -6,15 +6,23 @@ import re
 import inspect
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union, Literal, Callable, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Union, Literal, Callable, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from rich.console import Console
     from rich.live import Live
+    
+class FailoverManagerProtocol(Protocol):
+    """Protocol for failover manager implementations."""
+    def get_next_profile(self) -> Optional["AuthProfile"]: ...
+    def mark_failure(self, profile: "AuthProfile", error: str, is_rate_limit: bool = False) -> None: ...
+    def mark_success(self, profile: "AuthProfile") -> None: ...
 from pydantic import BaseModel
 import time
 import json
 import xml.etree.ElementTree as ET
+# Gap 2: Tool call execution imports
+from ..tools.call_executor import ToolCall, create_tool_call_executor
 # Display functions - lazy loaded to avoid importing rich at startup
 # These are only needed when output=verbose
 _display_module = None
@@ -352,6 +360,8 @@ Respond with ONLY a valid JSON tool call in this format:
         web_fetch: Optional[Union[bool, Dict[str, Any]]] = None,
         prompt_caching: Optional[bool] = None,
         claude_memory: Optional[Union[bool, Any]] = None,
+        failover_manager: Optional[FailoverManagerProtocol] = None,
+        auth: Optional[str] = None,           # NEW: "claude-code", "codex", "gemini-cli", "qwen-cli"
         **extra_settings
     ):
         # Configure logging only once at the class level
@@ -427,6 +437,18 @@ Respond with ONLY a valid JSON tool call in this format:
         self._rate_limiter = extra_settings.get('rate_limiter', None)
         self._max_retries = extra_settings.get('max_retries', 3)
         self._retry_delay = extra_settings.get('retry_delay', 60)  # Default 60 seconds
+        
+        # Subscription auth
+        self._auth_provider_id = auth
+        self._cached_subscription_creds = None  # SubscriptionCredentials | None
+        
+        # Failover management
+        self._failover_manager = failover_manager
+        self._current_profile = None  # Track current auth profile for failover
+        if self._failover_manager:
+            self._current_profile = self._failover_manager.get_next_profile()
+            if self._current_profile:
+                self._switch_to_profile(self._current_profile)
 
         # Cache for formatted tools and messages
         self._formatted_tools_cache = {}
@@ -648,8 +670,87 @@ Respond with ONLY a valid JSON tool call in this format:
 
         return any(indicator in error_str or indicator in error_type for indicator in indicators)
 
+    def _classify_error_and_should_retry(self, error: Exception, attempt: int = 1) -> tuple[str, bool, float]:
+        """Classify error and determine retry strategy using G5 error classifier.
+        
+        Args:
+            error: Exception to classify
+            attempt: Current attempt number (1-based)
+            
+        Returns:
+            Tuple of (category, should_retry, retry_delay)
+        """
+        try:
+            from .error_classifier import classify_error, should_retry, get_retry_delay, extract_retry_after
+            
+            category = classify_error(error)
+            can_retry = should_retry(category)
+            
+            if not can_retry:
+                return category.value, False, 0.0
+            
+            # For rate limits, try to extract specific retry-after first
+            if category.value == "rate_limit":
+                retry_after = extract_retry_after(error)
+                if retry_after:
+                    return category.value, True, retry_after
+            
+            # Use category-specific delay calculation with proper attempt
+            delay = get_retry_delay(category, attempt=attempt, base_delay=self._retry_delay)
+            return category.value, True, delay
+            
+        except ImportError:
+            # Fallback to legacy rate limit detection
+            is_rate_limit = self._is_rate_limit_error(error)
+            delay = self._parse_retry_delay(str(error)) if is_rate_limit else 0.0
+            return "rate_limit" if is_rate_limit else "unknown", is_rate_limit, delay
+
+    def _switch_to_profile(self, profile: "AuthProfile") -> None:
+        """Switch to a new auth profile for failover.
+        
+        Args:
+            profile: AuthProfile to switch to
+        """
+        if profile.api_key:
+            self.api_key = profile.api_key
+        if profile.base_url:
+            self.base_url = profile.base_url
+        if profile.model and profile.model != self.model:
+            # Only log if model actually changes
+            logging.info(f"Failover: switching from {self.model} to {profile.model}")
+            self.model = profile.model
+
+    def _resolve_subscription_creds(self):
+        """Lazy resolve + cache subscription credentials, checking expiration."""
+        if not self._auth_provider_id:
+            return None
+        
+        # Check if cached credentials are expired
+        if (self._cached_subscription_creds and 
+            self._cached_subscription_creds.expires_at_ms and
+            self._cached_subscription_creds.expires_at_ms <= int(time.time() * 1000)):
+            self._cached_subscription_creds = None
+            
+        if self._cached_subscription_creds is None:
+            from ..auth import resolve_subscription_credentials
+            self._cached_subscription_creds = resolve_subscription_credentials(
+                self._auth_provider_id,
+            )
+        return self._cached_subscription_creds
+
+    def _refresh_subscription_creds(self):
+        """Force refresh of subscription credentials."""
+        if not self._auth_provider_id:
+            return None
+        from ..auth.subscription.registry import get_subscription_provider
+        provider = get_subscription_provider(self._auth_provider_id)
+        if provider is None:
+            return None
+        self._cached_subscription_creds = provider.refresh()
+        return self._cached_subscription_creds
+
     def _call_with_retry(self, func, *args, **kwargs):
-        """Call a function with automatic retry on rate limit errors.
+        """Call a function with automatic retry on rate limit errors and failover support.
 
         Args:
             func: The function to call (e.g., litellm.completion)
@@ -670,20 +771,63 @@ Respond with ONLY a valid JSON tool call in this format:
                 if self._rate_limiter is not None:
                     self._rate_limiter.acquire()
 
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                
+                # Mark success if failover is configured
+                if self._failover_manager and self._current_profile:
+                    self._failover_manager.mark_success(self._current_profile)
+                    
+                return result
 
             except Exception as e:
-                if not self._is_rate_limit_error(e):
-                    raise
-
+                category, can_retry, retry_delay = self._classify_error_and_should_retry(e, attempt + 1)
+                
                 last_error = e
                 error_str = str(e)
 
-                if attempt < self._max_retries:
-                    retry_delay = self._parse_retry_delay(error_str)
+                # Check for auth errors and try refreshing subscription credentials
+                if category == "auth" and self._auth_provider_id and attempt == 0:
+                    try:
+                        logging.info("Authentication error detected - attempting credential refresh")
+                        refreshed_creds = self._refresh_subscription_creds()
+                        if refreshed_creds:
+                            # Update parameters with refreshed credentials (don't clear cache)
+                            kwargs = self._build_completion_params(**kwargs)
+                            # Retry immediately with refreshed credentials
+                            can_retry = True
+                            retry_delay = 0.0
+                            logging.info("Subscription credentials refreshed, retrying...")
+                    except Exception as refresh_error:
+                        logging.warning(f"Failed to refresh subscription credentials: {refresh_error}")
 
+                # Failover: mark failure and try next profile (do this before early exit)
+                if self._failover_manager and self._current_profile:
+                    is_rate_limit = (category == "rate_limit")
+                    self._failover_manager.mark_failure(
+                        self._current_profile, error_str, is_rate_limit=is_rate_limit
+                    )
+                    next_profile = self._failover_manager.get_next_profile()
+                    if next_profile and next_profile != self._current_profile:
+                        self._switch_to_profile(next_profile)
+                        self._current_profile = next_profile
+                        # Update the kwargs with new profile values for the next retry
+                        if "api_key" in kwargs:
+                            kwargs["api_key"] = self.api_key
+                        if "base_url" in kwargs:
+                            kwargs["base_url"] = self.base_url
+                        if "model" in kwargs:
+                            kwargs["model"] = self.model
+                        # Enable retry for profile switch even if originally non-retryable
+                        can_retry = True
+                        retry_delay = 0.0
+                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
+                
+                if not can_retry:
+                    raise
+
+                if attempt < self._max_retries:
                     logging.warning(
-                        f"Rate limit hit (attempt {attempt + 1}/{self._max_retries + 1}), "
+                        f"{category} error hit (attempt {attempt + 1}/{self._max_retries + 1}), "
                         f"waiting {retry_delay:.1f}s before retry..."
                     )
 
@@ -710,7 +854,7 @@ Respond with ONLY a valid JSON tool call in this format:
         raise last_error
 
     async def _call_with_retry_async(self, func, *args, **kwargs):
-        """Async version of _call_with_retry.
+        """Async version of _call_with_retry with failover support.
 
         Args:
             func: The async function to call
@@ -731,20 +875,63 @@ Respond with ONLY a valid JSON tool call in this format:
                 if self._rate_limiter is not None:
                     await self._rate_limiter.acquire_async()
 
-                return await func(*args, **kwargs)
+                result = await func(*args, **kwargs)
+                
+                # Mark success if failover is configured
+                if self._failover_manager and self._current_profile:
+                    self._failover_manager.mark_success(self._current_profile)
+                    
+                return result
 
             except Exception as e:
-                if not self._is_rate_limit_error(e):
-                    raise
-
+                category, can_retry, retry_delay = self._classify_error_and_should_retry(e, attempt + 1)
+                
                 last_error = e
                 error_str = str(e)
 
-                if attempt < self._max_retries:
-                    retry_delay = self._parse_retry_delay(error_str)
+                # Check for auth errors and try refreshing subscription credentials
+                if category == "auth" and self._auth_provider_id and attempt == 0:
+                    try:
+                        logging.info("Authentication error detected - attempting credential refresh")
+                        refreshed_creds = self._refresh_subscription_creds()
+                        if refreshed_creds:
+                            # Update parameters with refreshed credentials (don't clear cache)
+                            kwargs = self._build_completion_params(**kwargs)
+                            # Retry immediately with refreshed credentials
+                            can_retry = True
+                            retry_delay = 0.0
+                            logging.info("Subscription credentials refreshed, retrying...")
+                    except Exception as refresh_error:
+                        logging.warning(f"Failed to refresh subscription credentials: {refresh_error}")
 
+                # Failover: mark failure and try next profile (do this before early exit)
+                if self._failover_manager and self._current_profile:
+                    is_rate_limit = (category == "rate_limit")
+                    self._failover_manager.mark_failure(
+                        self._current_profile, error_str, is_rate_limit=is_rate_limit
+                    )
+                    next_profile = self._failover_manager.get_next_profile()
+                    if next_profile and next_profile != self._current_profile:
+                        self._switch_to_profile(next_profile)
+                        self._current_profile = next_profile
+                        # Update the kwargs with new profile values for the next retry
+                        if "api_key" in kwargs:
+                            kwargs["api_key"] = self.api_key
+                        if "base_url" in kwargs:
+                            kwargs["base_url"] = self.base_url
+                        if "model" in kwargs:
+                            kwargs["model"] = self.model
+                        # Enable retry for profile switch even if originally non-retryable
+                        can_retry = True
+                        retry_delay = 0.0
+                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
+                
+                if not can_retry:
+                    raise
+
+                if attempt < self._max_retries:
                     logging.warning(
-                        f"Rate limit hit (attempt {attempt + 1}/{self._max_retries + 1}), "
+                        f"{category} error hit (attempt {attempt + 1}/{self._max_retries + 1}), "
                         f"waiting {retry_delay:.1f}s before retry..."
                     )
 
@@ -1649,6 +1836,7 @@ Now provide your final answer using this result. Summarize the information natur
         task_description: Optional[str] = None,
         task_id: Optional[str] = None,
         execute_tool_fn: Optional[Callable] = None,
+        parallel_tool_calls: bool = False,  # Gap 2: Enable parallel tool execution
         stream: bool = True,
         stream_callback: Optional[Callable] = None,
         emit_events: bool = False,
@@ -1893,26 +2081,47 @@ Now provide your final answer using this result. Summarize the information natur
                                 "tool_calls": serializable_tool_calls,
                             })
 
-                            tool_results = []
+                            # Execute tool calls using ToolCallExecutor (Gap 2: parallel or sequential)
+                            is_ollama = self._is_ollama_provider()
+                            tool_calls_batch = []
+                            
+                            # Prepare batch of ToolCall objects
                             for tool_call in tool_calls:
-                                function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call)
-
-                                logging.debug(f"[RESPONSES_API] Executing tool {function_name} with args: {arguments}")
-                                tool_result = execute_tool_fn(function_name, arguments, tool_call_id=tool_call_id)
+                                function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama=is_ollama)
+                                tool_calls_batch.append(ToolCall(
+                                    function_name=function_name,
+                                    arguments=arguments,
+                                    tool_call_id=tool_call_id,
+                                    is_ollama=is_ollama
+                                ))
+                            
+                            # Create appropriate executor based on parallel_tool_calls setting
+                            executor = create_tool_call_executor(parallel=parallel_tool_calls)
+                            
+                            # Execute batch
+                            tool_results_batch = executor.execute_batch(tool_calls_batch, execute_tool_fn)
+                            
+                            tool_results = []
+                            for tool_call_obj, tool_result_obj in zip(tool_calls_batch, tool_results_batch):
+                                if tool_result_obj.error is not None:
+                                    raise tool_result_obj.error
+                                tool_result = tool_result_obj.result
                                 tool_results.append(tool_result)
                                 accumulated_tool_results.append(tool_result)
 
+                                logging.debug(f"[RESPONSES_API] Executed tool {tool_result_obj.function_name} with result: {tool_result}")
+
                                 if verbose:
-                                    display_message = f"Agent {agent_name} called function '{function_name}' with arguments: {arguments}\n"
+                                    display_message = f"Agent {agent_name} called function '{tool_call_obj.function_name}' with arguments: {tool_call_obj.arguments}\n"
                                     display_message += f"Function returned: {tool_result}" if tool_result else "Function returned no output"
                                     _get_display_functions()['display_tool_call'](display_message, console=self.console)
 
                                 result_str = json.dumps(tool_result) if tool_result else "empty"
                                 _get_display_functions()['execute_sync_callback'](
                                     'tool_call',
-                                    message=f"Calling function: {function_name}",
-                                    tool_name=function_name,
-                                    tool_input=arguments,
+                                    message=f"Calling function: {tool_call_obj.function_name}",
+                                    tool_name=tool_call_obj.function_name,
+                                    tool_input=tool_call_obj.arguments,
                                     tool_output=result_str[:200] if result_str else None,
                                 )
 
@@ -1927,7 +2136,7 @@ Now provide your final answer using this result. Summarize the information natur
                                     content = json.dumps(tool_result)
                                 messages.append({
                                     "role": "tool",
-                                    "tool_call_id": tool_call_id,
+                                    "tool_call_id": tool_result_obj.tool_call_id,
                                     "content": content,
                                 })
 
@@ -3142,6 +3351,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         task_description: Optional[str] = None,
         task_id: Optional[str] = None,
         execute_tool_fn: Optional[Callable] = None,
+        parallel_tool_calls: bool = False,  # Gap 2: Enable parallel tool execution
         **kwargs
     ):
         """Generator that yields real-time response chunks from the LLM.
@@ -3167,6 +3377,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             task_description: Optional task description for logging
             task_id: Optional task ID for logging
             execute_tool_fn: Optional function for executing tools
+            parallel_tool_calls: If True, execute batched LLM tool calls in parallel (default False)
             **kwargs: Additional parameters
             
         Yields:
@@ -3301,30 +3512,48 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 "tool_calls": serializable_tool_calls
                             })
                         
-                        # Execute tool calls and add results to conversation
+                        # Execute tool calls using ToolCallExecutor (Gap 2: parallel or sequential)
+                        is_ollama = self._is_ollama_provider()
+                        tool_calls_batch = []
+                        
+                        # Prepare batch of ToolCall objects
                         for tool_call in tool_calls:
-                            is_ollama = self._is_ollama_provider()
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
-                            
-                            try:
-                                # Execute the tool (pass tool_call_id for event correlation)
-                                tool_result = execute_tool_fn(function_name, arguments, tool_call_id=tool_call_id)
-                                
-                                # Add tool result to messages
-                                tool_message = self._create_tool_message(function_name, tool_result, tool_call_id, is_ollama)
-                                messages.append(tool_message)
-                                
-                            except Exception as e:
-                                logging.error(f"Tool execution error for {function_name}: {e}")
-                                # Add error message to conversation
-                                error_message = self._create_tool_message(
-                                    function_name, f"Error executing tool: {e}", tool_call_id, is_ollama
+                            tool_calls_batch.append(ToolCall(
+                                function_name=function_name,
+                                arguments=arguments, 
+                                tool_call_id=tool_call_id,
+                                is_ollama=is_ollama
+                            ))
+                        
+                        # Create appropriate executor based on parallel_tool_calls setting
+                        executor = create_tool_call_executor(parallel=parallel_tool_calls)
+                        
+                        # Execute batch and add results to conversation
+                        tool_results = executor.execute_batch(tool_calls_batch, execute_tool_fn)
+                        
+                        for tool_result in tool_results:
+                            if tool_result.error is None:
+                                # Successful execution
+                                tool_message = self._create_tool_message(
+                                    tool_result.function_name, 
+                                    tool_result.result, 
+                                    tool_result.tool_call_id, 
+                                    tool_result.is_ollama
                                 )
-                                messages.append(error_message)
+                            else:
+                                # Error during execution (already logged by executor)
+                                tool_message = self._create_tool_message(
+                                    tool_result.function_name,
+                                    tool_result.result,  # Contains error message
+                                    tool_result.tool_call_id,
+                                    tool_result.is_ollama
+                                )
+                            messages.append(tool_message)
                         
                         # Continue conversation after tool execution - get follow-up response
                         try:
-                            follow_up_response = litellm.completion(
+                            follow_up_response = self._completion_with_retry(
                                 **self._build_completion_params(
                                     messages=messages,
                                     tools=formatted_tools,
@@ -3340,7 +3569,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     # Yield the follow-up response after tool execution
                                     yield follow_up_content
                         except Exception as e:
-                            logging.error(f"Follow-up response failed: {e}")
+                            import time
+                            error_ref = f"followup-{int(time.time() * 1000)}"
+                            logging.error(
+                                "Follow-up response failed after retries (ref=%s, model=%s): %s",
+                                error_ref, getattr(self, 'model', 'unknown'), e
+                            )
+                            yield (
+                                f"\n\n[Error: Failed to generate final response after tool execution "
+                                f"(ref: {error_ref}). Please retry. If it continues, try reducing prompt size.]"
+                            )
                             
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -3359,7 +3597,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             if not use_streaming:
                 # Fall back to non-streaming and yield the complete response
                 try:
-                    response = litellm.completion(
+                    response = self._completion_with_retry(
                         **self._build_completion_params(
                             messages=messages,
                             tools=formatted_tools,
@@ -4418,6 +4656,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # Filter out internal parameters that shouldn't be passed to the API
             filtered_extra_settings = {k: v for k, v in self.extra_settings.items() if k != 'metrics'}
             params.update(filtered_extra_settings)
+        
+        # Inject subscription credentials if auth provider is set
+        creds = self._resolve_subscription_creds()
+        if creds:
+            # Use litellm's native OAuth detection (auto-detects sk-ant-oat-* and switches to Bearer)
+            params["api_key"] = creds.api_key
+            if creds.base_url:
+                params["base_url"] = creds.base_url
+            if creds.headers:
+                extra_headers = dict(params.get("extra_headers") or {})
+                extra_headers.update(creds.headers)
+                params["extra_headers"] = extra_headers
         
         # Override with any provided parameters
         params.update(override_params)

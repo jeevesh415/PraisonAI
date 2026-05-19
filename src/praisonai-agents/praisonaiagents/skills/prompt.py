@@ -1,24 +1,34 @@
 """XML prompt generation for Agent Skills."""
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import html
 
 from .models import SkillMetadata
 from .parser import read_properties
+from .budget import SkillPromptBudget, apply_budget
+
+
+# G22: Claude Code-equivalent cap on combined description + when_to_use.
+MAX_COMBINED_DESCRIPTION_CHARS = 1536
+
+
+def _truncate(text: str, limit: int) -> str:
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "\u2026"
 
 
 def format_skill_for_prompt(skill: SkillMetadata) -> str:
     """Format a single skill as XML for system prompt.
 
-    Args:
-        skill: SkillMetadata instance
-
-    Returns:
-        XML string for the skill
+    The ``description`` is truncated at 1,536 characters (G22) to keep the
+    system-prompt listing bounded even with large skill libraries.
     """
     name = html.escape(skill.name)
-    description = html.escape(skill.description)
+    description = html.escape(_truncate(skill.description, MAX_COMBINED_DESCRIPTION_CHARS))
     location = html.escape(skill.location)
 
     return f"""  <skill>
@@ -28,12 +38,13 @@ def format_skill_for_prompt(skill: SkillMetadata) -> str:
   </skill>"""
 
 
-def generate_skills_xml(skills: List[SkillMetadata], working_directory: str = None) -> str:
+def generate_skills_xml(skills: List[SkillMetadata], working_directory: str | None = None, budget: SkillPromptBudget | None = None) -> str:
     """Generate XML block for available skills.
 
     Args:
         skills: List of SkillMetadata instances
         working_directory: Current working directory for path resolution
+        budget: Optional budget to limit skills included in prompt
 
     Returns:
         XML string with <available_skills> block
@@ -41,16 +52,23 @@ def generate_skills_xml(skills: List[SkillMetadata], working_directory: str = No
     import os
     cwd = working_directory or os.getcwd()
     
+    # Apply budget if provided
+    if budget and skills:
+        skills, was_truncated = apply_budget(skills, budget)
+        truncation_note = " <note>Some skills were omitted due to prompt budget limits.</note>" if was_truncated else ""
+    else:
+        truncation_note = ""
+    
     if not skills:
         return f"""<available_skills>
   <working_directory>{html.escape(cwd)}</working_directory>
-  <note>When using run_skill_script, pass file paths relative to the working directory or as absolute paths. The tool will resolve relative paths automatically.</note>
+  <note>When using run_skill_script, pass file paths relative to the working directory or as absolute paths. The tool will resolve relative paths automatically.</note>{truncation_note}
 </available_skills>"""
 
     skill_entries = "\n".join(format_skill_for_prompt(s) for s in skills)
     return f"""<available_skills>
   <working_directory>{html.escape(cwd)}</working_directory>
-  <note>When using run_skill_script, pass file paths relative to the working directory or as absolute paths. The tool will resolve relative paths automatically.</note>
+  <note>When using run_skill_script, pass file paths relative to the working directory or as absolute paths. The tool will resolve relative paths automatically.</note>{truncation_note}
 {skill_entries}
 </available_skills>"""
 

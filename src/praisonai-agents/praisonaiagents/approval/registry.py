@@ -47,16 +47,31 @@ DEFAULT_DANGEROUS_TOOLS: Dict[str, str] = {
 }
 
 # Permission presets — resolved to deny frozensets at Agent.__init__ time.
-# Usage: Agent(approval="safe")
+# Usage: Agent(approval="safe") — or set PRAISONAI_TOOL_SAFETY=<preset>
+# which applies as the default when no ``approval=`` kwarg is passed.
+#
+# ``default`` is the baseline we apply when nothing is configured: it
+# only blocks operations the LLM should never execute unattended —
+# destructive file ops (delete/move/copy) and arbitrary shell/code
+# execution. Read, create and edit stay allowed because those are
+# what 99% of useful agent workflows need. Users who want the old
+# ``trust the LLM with everything`` behaviour pass ``approval="full"``
+# or set ``PRAISONAI_TOOL_SAFETY=off``; users who want stricter
+# controls can opt into ``approval="safe"`` or ``"read_only"``.
 PERMISSION_PRESETS = {
+    # "default" — blocks delete + shell/code exec. Allows read/create/edit.
+    "default": frozenset({
+        "execute_command", "kill_process", "execute_code", "acp_execute_command",
+        "delete_file", "move_file", "copy_file", "acp_delete_file",
+    }),
     # "safe" — blocks all dangerous tools (file writes, shell exec, etc.)
     "safe": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()),
-    # "read_only" — blocks dangerous tools + write operations
-    "read_only": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()) | frozenset({
-        "write_file", "copy_file", "move_file",
-    }),
-    # "full" — no restrictions
+    # "read_only" — alias of "safe" (blocks all dangerous tools)
+    "read_only": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()),
+    # "full" — no restrictions (trust the LLM). Equivalent to "off" env.
     "full": frozenset(),
+    # "off" — alias of "full" for the env-var off-switch.
+    "off": frozenset(),
 }
 
 class ApprovalRegistry:
@@ -75,6 +90,9 @@ class ApprovalRegistry:
         # Tool requirements (mirrors old APPROVAL_REQUIRED_TOOLS / TOOL_RISK_LEVELS)
         self._required_tools: Set[str] = set()
         self._risk_levels: Dict[str, str] = {}
+
+        # Per-agent, per-tool auto-approval (G-A fix)
+        self._agent_tool_auto_approve: Dict[tuple[str, str], bool] = {}
 
         # Context variables (per-coroutine / per-thread)
         self._approved_context: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
@@ -139,6 +157,20 @@ class ApprovalRegistry:
     def get_risk_level(self, tool_name: str) -> Optional[str]:
         return self._risk_levels.get(tool_name)
 
+    # ── Per-tool auto-approval (G-A fix) ─────────────────────────────────
+
+    def auto_approve_tool(self, tool_name: str, agent_name: str) -> None:
+        """Pre-approve a single tool for a specific agent."""
+        if not agent_name:
+            raise ValueError("Skill auto-approval requires a stable agent/session scope")
+        self._agent_tool_auto_approve[(agent_name, tool_name)] = True
+
+    def is_auto_approved(self, tool_name: str, agent_name: str) -> bool:
+        """Check if a tool is auto-approved for a specific agent."""
+        if not agent_name:
+            return False
+        return self._agent_tool_auto_approve.get((agent_name, tool_name), False)
+
     # ── Context helpers ──────────────────────────────────────────────────
 
     def mark_approved(self, tool_name: str) -> None:
@@ -189,6 +221,11 @@ class ApprovalRegistry:
         if self.is_already_approved(tool_name):
             return ApprovalDecision(approved=True, reason="Already approved in context")
 
+        # Check per-tool auto-approval (G-A fix)
+        if self.is_auto_approved(tool_name, agent_name):
+            self.mark_approved(tool_name)
+            return ApprovalDecision(approved=True, reason="Auto-approved (skill)", approver="skill")
+
         # Env auto-approve
         if self.is_env_auto_approve():
             self.mark_approved(tool_name)
@@ -236,6 +273,11 @@ class ApprovalRegistry:
 
         if self.is_already_approved(tool_name):
             return ApprovalDecision(approved=True, reason="Already approved in context")
+
+        # Check per-tool auto-approval (G-A fix)
+        if self.is_auto_approved(tool_name, agent_name):
+            self.mark_approved(tool_name)
+            return ApprovalDecision(approved=True, reason="Auto-approved (skill)", approver="skill")
 
         if self.is_env_auto_approve():
             self.mark_approved(tool_name)

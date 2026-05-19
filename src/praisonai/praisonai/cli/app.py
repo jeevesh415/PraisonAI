@@ -13,6 +13,92 @@ from .output.console import OutputController, OutputMode, set_output_controller
 from .state.identifiers import create_context
 
 
+def _setup_langfuse_observability(*, verbose: bool = False) -> None:
+    """Set up Langfuse observability by wiring TraceSink to action emitter."""
+    try:
+        from praisonai.observability.langfuse import LangfuseSink
+        from praisonaiagents.trace.protocol import TraceEmitter, set_default_emitter
+        from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+        import atexit
+        
+        # Create LangfuseSink (auto-reads env vars)
+        sink = LangfuseSink()
+        
+        # Set up action-level trace emitter (covers RouterAgent / PlanningAgent)
+        emitter = TraceEmitter(sink=sink, enabled=True)
+        set_default_emitter(emitter)
+        
+        # Set up context-level trace emitter (captures Agent.start() lifecycle)
+        context_emitter = ContextTraceEmitter(sink=sink.context_sink(), enabled=True)
+        set_context_emitter(context_emitter)
+        
+        # Register atexit close for the sink
+        atexit.register(sink.close)
+        
+    except ImportError:
+        # Gracefully degrade if Langfuse not installed
+        pass
+    except Exception as e:
+        # Avoid breaking CLI if observability setup fails
+        if verbose:
+            typer.echo(f"Warning: failed to initialize Langfuse observability: {e}", err=True)
+
+
+def _setup_langextract_observability(*, verbose: bool = False) -> None:
+    """Set up Langextract observability by wiring TraceSink to action emitter."""
+    try:
+        import importlib.util
+        
+        # Explicitly check if langextract is available before attempting to use it
+        if importlib.util.find_spec('langextract') is None:
+            if verbose:
+                typer.echo("Warning: langextract is not installed. Install with: pip install 'praisonai[langextract]'", err=True)
+            return
+        
+        from praisonai.observability.langextract import LangextractSink, LangextractSinkConfig
+        from praisonaiagents.trace.protocol import TraceEmitter, set_default_emitter
+        import os
+        import atexit
+        
+        # Build LangextractSinkConfig from env vars
+        config = LangextractSinkConfig(
+            output_path=os.getenv("PRAISONAI_LANGEXTRACT_OUTPUT", "praisonai-trace.html"),
+            auto_open=os.getenv("PRAISONAI_LANGEXTRACT_AUTO_OPEN", "false").lower() == "true",
+        )
+        
+        # Create LangextractSink
+        sink = LangextractSink(config=config)
+        
+        # Ensure sink is closed on exit to write the trace file
+        atexit.register(sink.close)
+        
+        # Set up action-level trace emitter (covers RouterAgent / PlanningAgent)
+        emitter = TraceEmitter(sink=sink, enabled=True)
+        set_default_emitter(emitter)
+
+        # Bridge the context emitter so regular Agent.start / tool calls / LLM
+        # responses are captured as well.  Without this, typical single-agent
+        # flows produce an empty trace (no agent_start/end, no tool events).
+        def warn_handler(msg: str):
+            if verbose:
+                typer.echo(f"Warning: {msg}", err=True)
+                
+        LangextractSink.bridge_context_events(
+            sink=sink,
+            session_id="praisonai-cli",
+            warn_callback=warn_handler
+        )
+
+    except ImportError:
+        # Gracefully degrade if langextract not installed
+        if verbose:
+            typer.echo("Warning: langextract is not installed. Install with: pip install 'praisonai[langextract]'", err=True)
+    except Exception as e:
+        # Avoid breaking CLI if observability setup fails
+        if verbose:
+            typer.echo(f"Warning: failed to initialize langextract observability: {e}", err=True)
+
+
 class OutputFormat(str, Enum):
     """Output format options."""
     text = "text"
@@ -38,6 +124,7 @@ class GlobalState:
     quiet: bool = False
     verbose: bool = False
     screen_reader: bool = False
+    observe: Optional[str] = None
     output_controller: Optional[OutputController] = None
 
 
@@ -98,6 +185,13 @@ def main_callback(
         "--screen-reader",
         help="Screen reader friendly output (no spinners/panels)",
     ),
+    observe: Optional[str] = typer.Option(
+        None,
+        "--observe",
+        "-O",
+        help="Enable observability (langfuse, langextract)",
+        envvar="PRAISONAI_OBSERVE",
+    ),
 ):
     """
     PraisonAI - AI Agents Framework CLI.
@@ -110,10 +204,23 @@ def main_callback(
     state.quiet = quiet
     state.verbose = verbose
     state.screen_reader = screen_reader
+    state.observe = observe
     
     # Handle --json alias
     if json_output:
         state.output_format = OutputFormat.json
+    
+    # Validate and set up observability if requested
+    if observe:
+        if observe == "langfuse":
+            _setup_langfuse_observability(verbose=verbose)
+        elif observe == "langextract":
+            _setup_langextract_observability(verbose=verbose)
+        else:
+            raise typer.BadParameter(
+                f"Unsupported observe provider: {observe}. "
+                "Choose one of: langfuse, langextract."
+            )
     
     # Determine output mode
     if state.quiet:
@@ -128,6 +235,10 @@ def main_callback(
         mode = OutputMode.STREAM_JSON
     else:
         mode = OutputMode.TEXT
+    
+    # Install warning filters for CLI usage only
+    from .main import install_warning_filters
+    install_warning_filters()
     
     # Create run context
     context = create_context()
@@ -166,11 +277,16 @@ def get_output_controller() -> OutputController:
 _commands_registered = False
 
 def register_commands():
-    """Register all command groups (idempotent)."""
+    """Register all command groups (idempotent).
+
+    The ``_commands_registered`` sentinel is intentionally flipped only after
+    every import and ``app.add_typer`` call has succeeded. Setting it before
+    would poison the registry on partial failure: a later caller would
+    short-circuit and dispatch against an incomplete command tree.
+    """
     global _commands_registered
     if _commands_registered:
         return
-    _commands_registered = True
     # Import command modules - Core commands
     from .commands.config import app as config_app
     from .commands.traces import app as traces_app
@@ -182,6 +298,8 @@ def register_commands():
     from .commands.lsp import app as lsp_app
     from .commands.diag import app as diag_app
     from .commands.doctor import app as doctor_app
+    from .commands.setup import app as setup_app
+    from .commands.onboard import app as onboard_app
     from .commands.obs import app as obs_app
     from .commands.acp import app as acp_app
     from .commands.mcp import app as mcp_app
@@ -204,6 +322,7 @@ def register_commands():
     from .commands.memory import app as memory_app
     from .commands.workflow import app as workflow_app
     from .commands.tools import app as tools_app
+    from .commands.n8n import app as n8n_app
     from .commands.knowledge import app as knowledge_app
     from .commands.rag import app as rag_app
     from .commands import retrieval as retrieval_module
@@ -233,15 +352,18 @@ def register_commands():
     # Import new moltbot-inspired commands
     from .commands.bot import app as bot_app
     from .commands.gateway import app as gateway_app
+    from .commands.pairing import app as pairing_app
     from .commands.browser import app as browser_app
     from .commands.plugins import app as plugins_app
     from .commands.sandbox import app as sandbox_app
     from .commands.claw import app as claw_app
     from .commands.flow import app as flow_app
-    from .commands.unified import app as unified_app
+    from .commands.dashboard import app as unified_app
     from .commands.langfuse import app as langfuse_app
+    from .commands.langextract import app as langextract_app
     from .commands.port import app as port_app
     from .commands.managed import app as managed_app
+    from .commands.up import app as up_app
     
     # Import TUI and queue commands
     from .features.tui.debug import create_debug_app as create_tui_debug_app
@@ -258,6 +380,8 @@ def register_commands():
     app.add_typer(lsp_app, name="lsp", help="LSP service lifecycle")
     app.add_typer(diag_app, name="diag", help="Diagnostics export")
     app.add_typer(doctor_app, name="doctor", help="Health checks and diagnostics")
+    app.add_typer(setup_app, name="setup", help="Interactive onboarding / configuration wizard")
+    app.add_typer(onboard_app, name="onboard", help="Messaging bot onboarding wizard")
     app.add_typer(obs_app, name="obs", help="Observability diagnostics and management")
     app.add_typer(acp_app, name="acp", help="Agent Client Protocol server")
     app.add_typer(mcp_app, name="mcp", help="MCP server management")
@@ -280,6 +404,7 @@ def register_commands():
     app.add_typer(memory_app, name="memory", help="Memory management")
     app.add_typer(workflow_app, name="workflow", help="Workflow management")
     app.add_typer(tools_app, name="tools", help="Tool management")
+    app.add_typer(n8n_app, name="n8n", help="n8n visual workflow editor integration")
     app.add_typer(knowledge_app, name="knowledge", help="Knowledge base management (legacy)")
     app.add_typer(rag_app, name="rag", help="RAG commands (legacy - use index/query instead)")
     
@@ -418,6 +543,7 @@ def register_commands():
     # Register moltbot-inspired commands
     app.add_typer(bot_app, name="bot", help="Messaging bots with full agent capabilities")
     app.add_typer(gateway_app, name="gateway", help="Multi-bot WebSocket gateway server")
+    app.add_typer(pairing_app, name="pairing", help="Manage bot user pairing")
     app.add_typer(browser_app, name="browser", help="Browser control for agent automation")
     app.add_typer(plugins_app, name="plugins", help="Plugin management and inspection")
     app.add_typer(sandbox_app, name="sandbox", help="Sandbox container management")
@@ -425,7 +551,9 @@ def register_commands():
     app.add_typer(flow_app, name="flow", help="Visual workflow builder (Langflow)")
     app.add_typer(unified_app, name="dashboard", help="🌟 Unified Dashboard (Flow + Claw + UI)")
     app.add_typer(langfuse_app, name="langfuse", help="🔍 Langfuse observability platform")
+    app.add_typer(langextract_app, name="langextract", help="🧠 Langextract visual trace layer")
     app.add_typer(port_app, name="port", help="🔌 Manage port usage and resolve conflicts")
+    app.add_typer(up_app, name="up", help="🚀 Start unified PraisonAI stack (Langfuse + Langflow)")
     
     # Register standardise command
     try:
@@ -543,6 +671,12 @@ def register_commands():
         app.add_typer(tui_app, name="tui", help="Interactive TUI and simulation")
     if queue_app:
         app.add_typer(queue_app, name="queue", help="Queue management")
+
+    # Mark registration complete only after every import + add_typer above
+    # has succeeded. If anything raised, this line is skipped and the next
+    # caller will retry from scratch instead of dispatching against a
+    # half-built command tree.
+    _commands_registered = True
 
 
 # Register commands on import

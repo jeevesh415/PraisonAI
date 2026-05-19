@@ -11,8 +11,6 @@ import time
 import json
 import logging
 from praisonaiagents._logging import get_logger
-import asyncio
-import threading
 from ..errors import BudgetExceededError
 
 # Fallback helpers to avoid circular imports
@@ -45,9 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 
-import traceback
-from typing import List, Optional, Any, Dict, Union, Callable, Generator, TYPE_CHECKING
-from collections import OrderedDict
+from typing import List, Optional, Any, Dict, Union, Generator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass
@@ -233,8 +229,21 @@ Your Goal: {self.goal}"""
         """
         try:
             from ..llm.model_capabilities import supports_structured_outputs
+        except ImportError:
+            return False  # Module genuinely not available — acceptable
+
+        try:
             return supports_structured_outputs(self.llm)
-        except Exception:
+        except Exception as e:
+            logging.warning(
+                "Structured output capability check failed for agent %s (model=%r); "
+                "falling back to prompt-based schema formatting. Check model capability "
+                "configuration and optional provider dependencies: %s",
+                getattr(self, "name", "<unknown>"),
+                self.llm,
+                e,
+                exc_info=True,
+            )
             return False
 
     def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None, use_native_format=False):
@@ -457,6 +466,29 @@ Your Goal: {self.goal}"""
         
         return content
 
+    def _extract_llm_response_content(self, response) -> Optional[str]:
+        """Return assistant message text, a tool-call summary, or str(response) as fallback."""
+        if not response:
+            return None
+        try:
+            if hasattr(response, "choices") and response.choices:
+                choice = response.choices[0]
+                msg = getattr(choice, "message", None)
+                if msg is not None:
+                    content = getattr(msg, "content", None)
+                    if content:
+                        return content
+                    tool_calls = getattr(msg, "tool_calls", None) or []
+                    if tool_calls:
+                        names = [getattr(tc.function, "name", "?") for tc in tool_calls]
+                        return f"[tool_calls: {', '.join(names)}]"
+        except (AttributeError, IndexError, TypeError) as e:
+            logging.warning(
+                f"Failed to extract LLM response content (falling back to str): {e}"
+            )
+            # Fallback to str(response) is still fine, but now it's visible
+        return str(response)
+
     def _process_stream_response(self, messages, temperature, start_time, formatted_tools=None, reasoning_steps=False):
         """Internal helper for streaming response processing with real-time events."""
         if self._openai_client is None:
@@ -475,7 +507,7 @@ Your Goal: {self.goal}"""
             emit_events=True
         )
 
-    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None):
+    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0):
         start_time = time.time()
 
         # --- Context compaction (opt-in via ExecutionConfig.context_compaction) ---
@@ -490,8 +522,10 @@ Your Goal: {self.goal}"""
                 if _compactor.needs_compaction(messages):
                     try:
                         self._hook_runner.execute_sync(_HookEvent.BEFORE_COMPACTION, None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+                        if getattr(self, '_strict_hooks', False):
+                            raise
                     compacted_msgs, _cr = _compactor.compact(messages)
                     messages[:] = compacted_msgs  # in-place update so callers see the change
                     logging.info(
@@ -500,9 +534,13 @@ Your Goal: {self.goal}"""
                     )
                     try:
                         self._hook_runner.execute_sync(_HookEvent.AFTER_COMPACTION, None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+                        if getattr(self, '_strict_hooks', False):
+                            raise
             except Exception as _ce:
+                if getattr(self, '_strict_hooks', False):
+                    raise
                 logging.debug(f"[compaction] skipped (non-fatal): {_ce}")
 
         # Trigger BEFORE_LLM hook
@@ -518,7 +556,11 @@ Your Goal: {self.goal}"""
             temperature=temperature
         )
         self._hook_runner.execute_sync(HookEvent.BEFORE_LLM, before_llm_input)
-        
+        # C7 — honour any BEFORE_LLM hook that mutated the message stream
+        # (e.g. PII redactor). The runner applies modified_input in-place on
+        # before_llm_input.messages; adopt that value for the actual LLM call.
+        messages = before_llm_input.messages
+
         logging.debug(f"{self.name} sending messages to LLM: {messages}")
         
         # Emit LLM request trace event (zero overhead when not set)
@@ -572,7 +614,7 @@ Your Goal: {self.goal}"""
             _trace_emitter.llm_response(
                 self.name,
                 duration_ms=_duration_ms,
-                response_content=str(final_response) if final_response else None,
+                response_content=self._extract_llm_response_content(final_response),
                 prompt_tokens=_prompt_tokens,
                 completion_tokens=_completion_tokens,
                 cost_usd=_cost_usd,
@@ -625,6 +667,7 @@ Your Goal: {self.goal}"""
         except BudgetExceededError:
             raise
         except Exception as e:
+            from ..errors import LLMError
             error_str = str(e).lower()
             
             # Check if this is a context overflow error
@@ -657,11 +700,22 @@ Your Goal: {self.goal}"""
                         f"{estimate_messages_tokens(truncated_messages)} tokens"
                     )
                     
-                    # Retry with truncated messages (recursive call with truncated context)
-                    return self._chat_completion(
-                        truncated_messages, temperature, tools, stream, 
-                        reasoning_steps, task_name, task_description, task_id, response_format
-                    )
+                    # Retry with truncated messages (recursive call with depth limit)
+                    if _retry_depth < 2:
+                        return self._chat_completion(
+                            truncated_messages, temperature, tools, stream, 
+                            reasoning_steps, task_name, task_description, task_id, response_format, 
+                            _retry_depth=_retry_depth + 1
+                        )
+                    else:
+                        logging.error(f"[{self.name}] Context overflow retry limit exceeded")
+                        raise LLMError(
+                            f"Context overflow could not be resolved after {_retry_depth} attempts", 
+                            model_name=model_name, agent_id=self.name, is_retryable=False
+                        ) from e
+                except LLMError:
+                    # Re-raise LLMError (including depth limit errors) without swallowing
+                    raise
                 except Exception as recovery_error:
                     logging.error(f"[{self.name}] Overflow recovery failed: {recovery_error}")
             
@@ -673,8 +727,47 @@ Your Goal: {self.goal}"""
                 finish_reason="error",
                 response_content=str(e),  # Include error for context replay
             )
-            _get_display_functions()['display_error'](f"Error in chat completion: {e}")
-            return None
+            
+            # Classify and raise structured error with improved transient failure detection
+            model_name = self.llm if isinstance(self.llm, str) else "unknown"
+            session_id = getattr(self, '_session_id', 'unknown')
+            
+            # Check for retryable errors (rate limits, transient network issues, provider errors)
+            retryable_indicators = [
+                "rate limit", "429", "too many requests",
+                "timeout", "connection reset", "connection error", "socket error",
+                "500", "502", "503", "504", "service unavailable", "internal server error",
+                "dns", "network", "connection refused"
+            ]
+            
+            # Check for non-retryable errors (auth issues)
+            auth_indicators = ["401", "403", "authentication", "unauthorized", "invalid_api_key"]
+            
+            if any(phrase in error_str.lower() for phrase in retryable_indicators):
+                is_retryable = True
+            elif any(phrase in error_str.lower() for phrase in auth_indicators):
+                is_retryable = False
+            else:
+                # Default to retryable for unknown errors to be more resilient
+                is_retryable = True
+            
+            # Create LLMError with contextual metadata
+            error = LLMError(
+                str(e), 
+                model_name=model_name, 
+                agent_id=self.name, 
+                is_retryable=is_retryable,
+                session_id=session_id
+            )
+            
+            # Call error hook if available for error interception
+            if hasattr(self, 'on_error') and self.on_error:
+                try:
+                    self.on_error(error)
+                except Exception as hook_error:
+                    logging.debug(f"Error in on_error hook: {hook_error}")
+            
+            raise error from e
 
     def _execute_unified_chat_completion(
         self, 
@@ -995,7 +1088,68 @@ Your Goal: {self.goal}"""
             logging.warning(f"Tool output truncation error: {e}")
             return output
 
-    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None) -> Optional[str]:
+    def _resolve_skill_invocation(self, prompt):
+        """If ``prompt`` is ``/skill-name [args]``, render the skill body.
+
+        Returns:
+            The rendered prompt when a user-invocable skill matches, else
+            the original ``prompt`` unchanged. Non-string prompts (e.g.
+            multimodal lists) are returned as-is.
+        """
+        if not isinstance(prompt, str):
+            return prompt
+        text = prompt.lstrip()
+        if not text.startswith("/"):
+            return prompt
+        # Avoid path-like "/usr/..." inputs
+        head = text[1:].split(None, 1)
+        if not head:
+            return prompt
+        name = head[0]
+        args = head[1] if len(head) > 1 else ""
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            return prompt
+        mgr = getattr(self, "skill_manager", None)
+        if mgr is None:
+            return prompt
+        rendered = mgr.invoke(name, raw_args=args)
+        if rendered is None:
+            return prompt
+        # G-A fix: Best-effort pre-approve any tools declared under
+        # `allowed-tools` in the skill frontmatter. Non-fatal on error.
+        try:
+            tool_names = mgr.get_allowed_tools(name)
+            if tool_names:
+                from ..approval import get_approval_registry
+
+                registry = get_approval_registry()
+                agent_name = getattr(self, "display_name", getattr(self, "name", None))
+                if agent_name:  # Only approve if we have a stable agent identifier
+                    for _tn in tool_names:
+                        try:
+                            registry.auto_approve_tool(_tn, agent_name=agent_name)
+                        except Exception as exc:  # pragma: no cover - approval is optional
+                            logging.debug(
+                                "Failed to auto-approve skill tool '%s' for skill '%s' on agent '%s': %s. "
+                                "The skill will continue, but this tool may still require explicit approval.",
+                                _tn,
+                                name,
+                                agent_name,
+                                exc,
+                                exc_info=True,
+                            )
+        except Exception as exc:  # pragma: no cover - approval is optional
+            logging.debug(
+                "Failed to resolve allowed tools for skill '%s' on agent '%s': %s. "
+                "The skill will continue without pre-approving tools.",
+                name,
+                getattr(self, "name", None),
+                exc,
+                exc_info=True,
+            )
+        return rendered
+
+    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None) -> Optional[str]:
         """
         Chat with the agent.
         
@@ -1008,6 +1162,10 @@ Your Goal: {self.goal}"""
                         'required' forces the LLM to call a tool before responding.
             ...other args...
         """
+        # Slash-command invocation: /skill-name [args] renders the skill
+        # body before any backend/LLM call.
+        prompt = self._resolve_skill_invocation(prompt)
+
         # Check if external managed backend is configured
         if hasattr(self, 'backend') and self.backend is not None:
             # Extract kwargs for delegation, excluding 'self' and function locals
@@ -1035,11 +1193,17 @@ Your Goal: {self.goal}"""
         _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
         
         try:
-            return self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice)
+            # C2 — cooperative cancellation: abort early if a pre-set token is given
+            _cancel = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
+            if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
+                reason = getattr(_cancel, "reason", None) or "cancelled before LLM call"
+                raise InterruptedError(f"Agent chat cancelled: {reason}")
+
+            return self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice, seed=seed, cancel_token=_cancel)
         finally:
             _trace_emitter.agent_end(self.name)
 
-    def _chat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None):
+    def _chat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None, seed=None, cancel_token=None):
         """Internal chat implementation (extracted for trace wrapping)."""
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
@@ -1250,6 +1414,7 @@ Your Goal: {self.goal}"""
                         task_description=task_description,
                         task_id=task_id,
                         execute_tool_fn=self.execute_tool,
+                        parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
                         reasoning_steps=reasoning_steps,
                         stream=stream
                     )
@@ -1259,7 +1424,16 @@ Your Goal: {self.goal}"""
                     effective_tool_choice = tool_choice or getattr(self, '_yaml_tool_choice', None)
                     if effective_tool_choice:
                         llm_kwargs['tool_choice'] = effective_tool_choice
-                    
+
+                    # C1 — per-call seed overrides llm_instance.seed for determinism
+                    if seed is not None:
+                        llm_kwargs['seed'] = seed
+
+                    # C2 — last-chance cancel check before handing to the LLM
+                    if cancel_token is not None and getattr(cancel_token, 'is_set', lambda: False)():
+                        reason = getattr(cancel_token, 'reason', None) or 'cancelled'
+                        raise InterruptedError(f"Agent chat cancelled: {reason}")
+
                     response_text = self.llm_instance.get_response(**llm_kwargs)
 
                     self._add_to_chat_history("assistant", response_text)
@@ -1280,11 +1454,11 @@ Your Goal: {self.goal}"""
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
-                        self.chat_history = self.chat_history[:chat_history_length]
+                        self._truncate_chat_history(chat_history_length)
                         return None
                 except Exception as e:
                     # Rollback chat history if LLM call fails
-                    self.chat_history = self.chat_history[:chat_history_length]
+                    self._truncate_chat_history(chat_history_length)
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                     return None
             except Exception as e:
@@ -1325,7 +1499,7 @@ Your Goal: {self.goal}"""
                     self.chat_history[-1].get("role") == "user" and 
                     self.chat_history[-1].get("content") == normalized_content):
                 # Add user message to chat history BEFORE LLM call so handoffs can access it
-                self.chat_history.append({"role": "user", "content": normalized_content})
+                self._append_to_chat_history({"role": "user", "content": normalized_content})
                 # Persist user message to DB (OpenAI path)
                 self._persist_message("user", normalized_content)
 
@@ -1369,7 +1543,7 @@ Your Goal: {self.goal}"""
                         response = self._chat_completion(messages, temperature=temperature, tools=tools if tools else None, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id, response_format=response_format)
                         if not response:
                             # Rollback chat history on response failure
-                            self.chat_history = self.chat_history[:chat_history_length]
+                            self._truncate_chat_history(chat_history_length)
                             return None
 
                         # Handle None content (can happen with tool calls or empty responses)
@@ -1380,7 +1554,7 @@ Your Goal: {self.goal}"""
                         if output_json or output_pydantic:
                             # Add to chat history and return raw response
                             # User message already added before LLM call via _build_messages
-                            self.chat_history.append({"role": "assistant", "content": response_text})
+                            self._append_to_chat_history({"role": "assistant", "content": response_text})
                             # Persist assistant message to DB
                             self._persist_message("assistant", response_text)
                             # Apply guardrail validation even for JSON output
@@ -1392,12 +1566,12 @@ Your Goal: {self.goal}"""
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
-                                self.chat_history = self.chat_history[:chat_history_length]
+                                self._truncate_chat_history(chat_history_length)
                                 return None
 
                         if not self.self_reflect:
                             # User message already added before LLM call via _build_messages
-                            self.chat_history.append({"role": "assistant", "content": response_text})
+                            self._append_to_chat_history({"role": "assistant", "content": response_text})
                             # Persist assistant message to DB (non-reflect path)
                             self._persist_message("assistant", response_text)
                             if self.verbose:
@@ -1413,7 +1587,7 @@ Your Goal: {self.goal}"""
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
                                     # Rollback chat history on guardrail failure
-                                    self.chat_history = self.chat_history[:chat_history_length]
+                                    self._truncate_chat_history(chat_history_length)
                                     return None
                             # Apply guardrail to regular response
                             try:
@@ -1424,7 +1598,7 @@ Your Goal: {self.goal}"""
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                 # Rollback chat history on guardrail failure
-                                self.chat_history = self.chat_history[:chat_history_length]
+                                self._truncate_chat_history(chat_history_length)
                                 return None
 
                         reflection_prompt = f"""
@@ -1483,7 +1657,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 if self.verbose:
                                     _get_display_functions()['display_self_reflection']("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
                                 # User message already added before LLM call via _build_messages
-                                self.chat_history.append({"role": "assistant", "content": response_text})
+                                self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
                                 try:
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
@@ -1494,7 +1668,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                     # Rollback chat history on guardrail failure
-                                    self.chat_history = self.chat_history[:chat_history_length]
+                                    self._truncate_chat_history(chat_history_length)
                                     self._end_run(None, "error", {"error": str(e)})
                                     return None
 
@@ -1503,7 +1677,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 if self.verbose:
                                     _get_display_functions()['display_self_reflection']("Maximum reflection count reached, returning current response", console=self.console)
                                 # User message already added before LLM call via _build_messages
-                                self.chat_history.append({"role": "assistant", "content": response_text})
+                                self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
                                 try:
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
@@ -1513,7 +1687,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                     # Rollback chat history on guardrail failure
-                                    self.chat_history = self.chat_history[:chat_history_length]
+                                    self._truncate_chat_history(chat_history_length)
                                     return None
                             
                             # If not satisfactory and not at max reflections, continue with regeneration
@@ -1540,7 +1714,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 # Catch any exceptions that escape the while loop
                 _get_display_functions()['display_error'](f"Unexpected error in chat: {e}", console=self.console)
                 # Rollback chat history
-                self.chat_history = self.chat_history[:chat_history_length]
+                self._truncate_chat_history(chat_history_length)
                 return None
 
     def clean_json_output(self, output: str) -> str:
@@ -1555,7 +1729,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             cleaned = cleaned[:-3].strip()
         return cleaned  
 
-    async def achat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None):
+    async def achat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None):
         """Async version of chat method with self-reflection support.
         
         Args:
@@ -1563,6 +1737,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             attachments: Optional list of image/file paths that are ephemeral
                         (used for THIS turn only, NEVER stored in history).
         """
+        # Slash-command invocation: /skill-name [args] renders the skill body.
+        prompt = self._resolve_skill_invocation(prompt)
+
         # Emit context trace event (zero overhead when not set)
         from ..trace.context_events import get_context_emitter
         _trace_emitter = get_context_emitter()
@@ -1575,13 +1752,20 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 reasoning_steps=reasoning_steps, stream=stream,
                 task_name=task_name, task_description=task_description, task_id=task_id,
                 config=config, force_retrieval=force_retrieval, skip_retrieval=skip_retrieval,
-                attachments=attachments, _trace_emitter=_trace_emitter, tool_choice=tool_choice
+                attachments=attachments, _trace_emitter=_trace_emitter, tool_choice=tool_choice,
+                seed=seed, cancel_token=cancel_token
             )
         finally:
             _trace_emitter.agent_end(self.name)
 
-    async def _achat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None):
+    async def _achat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None, seed=None, cancel_token=None):
         """Internal async chat implementation (extracted for trace wrapping)."""
+        # C2 — cooperative cancellation: abort early if a pre-set token is given
+        _cancel = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
+        if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
+            reason = getattr(_cancel, "reason", None) or "cancelled before LLM call"
+            raise InterruptedError(f"Agent chat cancelled: {reason}")
+        
         # Use agent's stream setting if not explicitly provided
         if stream is None:
             stream = self.stream
@@ -1669,7 +1853,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         self.chat_history[-1].get("role") == "user" and 
                         self.chat_history[-1].get("content") == normalized_content):
                     # Add user message to chat history BEFORE LLM call so handoffs can access it
-                    self.chat_history.append({"role": "user", "content": normalized_content})
+                    self._append_to_chat_history({"role": "user", "content": normalized_content})
 
                 # --- Context compaction (async custom LLM path) ---
                 _exec_cfg = getattr(self, 'execution', None)
@@ -1682,48 +1866,67 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         if _cw.needs_compaction(self.chat_history):
                             try:
                                 await self._hook_runner.execute(_HE.BEFORE_COMPACTION, None)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+                                if getattr(self, '_strict_hooks', False):
+                                    raise
                             _ch, _cr = _cw.compact(self.chat_history)
-                            self.chat_history[:] = _ch
+                            self._replace_chat_history(_ch)
                             logging.info(
                                 f"[compaction] {self.name}: {_cr.original_tokens}→{_cr.compacted_tokens} tokens "
                                 f"({_cr.messages_removed} messages removed)"
                             )
                             try:
                                 await self._hook_runner.execute(_HE.AFTER_COMPACTION, None)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+                                if getattr(self, '_strict_hooks', False):
+                                    raise
                     except Exception as _ce:
+                        if getattr(self, '_strict_hooks', False):
+                            raise
                         logging.debug(f"[compaction] skipped (non-fatal): {_ce}")
 
                 try:
-                    response_text = await self.llm_instance.get_response_async(
-                        prompt=prompt,
-                        system_prompt=self._build_system_prompt(tools),
-                        chat_history=self.chat_history,
-                        temperature=temperature,
-                        tools=tools,
-                        output_json=output_json,
-                        output_pydantic=output_pydantic,
-                        verbose=self.verbose,
-                        markdown=self.markdown,
-                        reflection=self.self_reflect,
-                        max_reflect=self.max_reflect,
-                        min_reflect=self.min_reflect,
-                        console=self.console,
-                        agent_name=self.name,
-                        agent_role=self.role,
-                        agent_tools=[t.__name__ if hasattr(t, '__name__') else str(t) for t in (tools if tools is not None else self.tools)],
-                        task_name=task_name,
-                        task_description=task_description,
-                        task_id=task_id,
-                        execute_tool_fn=self.execute_tool_async,
-                        reasoning_steps=reasoning_steps,
-                        stream=stream
-                    )
+                    # C1 — per-call seed forwarding (async path)  
+                    llm_kwargs = {
+                        'prompt': prompt,
+                        'system_prompt': self._build_system_prompt(tools),
+                        'chat_history': self.chat_history,
+                        'temperature': temperature,
+                        'tools': tools,
+                        'output_json': output_json,
+                        'output_pydantic': output_pydantic,
+                        'verbose': self.verbose,
+                        'markdown': self.markdown,
+                        'reflection': self.self_reflect,
+                        'max_reflect': self.max_reflect,
+                        'min_reflect': self.min_reflect,
+                        'console': self.console,
+                        'agent_name': self.name,
+                        'agent_role': self.role,
+                        'agent_tools': [t.__name__ if hasattr(t, '__name__') else str(t) for t in (tools if tools is not None else self.tools)],
+                        'task_name': task_name,
+                        'task_description': task_description,
+                        'task_id': task_id,
+                        'execute_tool_fn': self.execute_tool_async,
+                        'parallel_tool_calls': getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
+                        'reasoning_steps': reasoning_steps,
+                        'stream': stream
+                    }
+                    
+                    # C1 — per-call seed overrides llm_instance.seed for determinism  
+                    if seed is not None:
+                        llm_kwargs['seed'] = seed
+                    
+                    # C2 — last-chance cancel check before handing to the LLM
+                    if _cancel is not None and getattr(_cancel, 'is_set', lambda: False)():
+                        reason = getattr(_cancel, 'reason', None) or 'cancelled'
+                        raise InterruptedError(f"Agent chat cancelled: {reason}")
+                    
+                    response_text = await self.llm_instance.get_response_async(**llm_kwargs)
 
-                    self.chat_history.append({"role": "assistant", "content": response_text})
+                    self._append_to_chat_history({"role": "assistant", "content": response_text})
 
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
@@ -1738,11 +1941,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
-                        self.chat_history = self.chat_history[:chat_history_length]
+                        self._truncate_chat_history(chat_history_length)
                         return None
                 except Exception as e:
                     # Rollback chat history if LLM call fails
-                    self.chat_history = self.chat_history[:chat_history_length]
+                    self._truncate_chat_history(chat_history_length)
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
@@ -1767,7 +1970,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     self.chat_history[-1].get("role") == "user" and 
                     self.chat_history[-1].get("content") == normalized_content):
                 # Add user message to chat history BEFORE LLM call so handoffs can access it
-                self.chat_history.append({"role": "user", "content": normalized_content})
+                self._append_to_chat_history({"role": "user", "content": normalized_content})
 
             # --- Context compaction (async standard OpenAI path) ---
             _exec_cfg2 = getattr(self, 'execution', None)
@@ -1917,8 +2120,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         if self.verbose:
                                             _get_display_functions()['display_self_reflection'](f"Agent {self.name}: Self-reflection with structured output is not supported for custom LLM providers. Skipping reflection.", console=self.console)
                                         # Return the original response without reflection
-                                        self.chat_history.append({"role": "user", "content": original_prompt})
-                                        self.chat_history.append({"role": "assistant", "content": response_text})
+                                        self._append_to_chat_history({"role": "user", "content": original_prompt})
+                                        self._append_to_chat_history({"role": "assistant", "content": response_text})
                                         if get_logger().getEffectiveLevel() == logging.DEBUG:
                                             total_time = time.time() - start_time
                                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
@@ -1984,7 +2187,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         except Exception as e:
                             logging.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
                             # Rollback chat history on guardrail failure
-                            self.chat_history = self.chat_history[:chat_history_length]
+                            self._truncate_chat_history(chat_history_length)
                             return None
                 except Exception as e:
                     _get_display_functions()['display_error'](f"Error in chat completion: {e}")
@@ -2046,13 +2249,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     except Exception as _hook_err:
                         logging.debug(f"BEFORE_TOOL hook error (non-fatal): {_hook_err}")
 
-                    # Check if the tool is async
-                    if asyncio.iscoroutinefunction(tool):
-                        result = await tool(**arguments)
-                    else:
-                        # Run sync function in executor to avoid blocking
-                        loop = asyncio.get_running_loop()
-                        result = await loop.run_in_executor(None, lambda: tool(**arguments))
+                    # Route through safety pipeline instead of direct execution
+                    # Pass the tools list to honor task-scoped tools
+                    result = await self.execute_tool_async(function_name, arguments, tools_override=tools)
 
                     # --- AFTER_TOOL hook ---
                     try:
@@ -2227,7 +2426,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 if not (self.chat_history and 
                         self.chat_history[-1].get("role") == "user" and 
                         self.chat_history[-1].get("content") == normalized_content):
-                    self.chat_history.append({"role": "user", "content": normalized_content})
+                    self._append_to_chat_history({"role": "user", "content": normalized_content})
                 
                 try:
                     # Use the new streaming generator from LLM class
@@ -2248,18 +2447,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         task_name=kwargs.get('task_name'),
                         task_description=kwargs.get('task_description'),
                         task_id=kwargs.get('task_id'),
-                        execute_tool_fn=self.execute_tool
+                        execute_tool_fn=self.execute_tool,
+                        parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False)
                     ):
                         response_content += chunk
                         yield chunk
                     
                     # Add complete response to chat history
                     if response_content:
-                        self.chat_history.append({"role": "assistant", "content": response_content})
+                        self._append_to_chat_history({"role": "assistant", "content": response_content})
                         
                 except Exception as e:
                     # Rollback chat history on error
-                    self.chat_history = self.chat_history[:chat_history_length]
+                    self._truncate_chat_history(chat_history_length)
                     logging.error(f"Custom LLM streaming error: {e}")
                     raise
                     
@@ -2302,7 +2502,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 if not (self.chat_history and 
                         self.chat_history[-1].get("role") == "user" and 
                         self.chat_history[-1].get("content") == normalized_content):
-                    self.chat_history.append({"role": "user", "content": normalized_content})
+                    self._append_to_chat_history({"role": "user", "content": normalized_content})
                 
                 try:
                     # Check if OpenAI client is available
@@ -2414,7 +2614,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     "function": tc['function']
                                 } for tc in tool_calls_data if tc['id']
                             ]
-                        self.chat_history.append(assistant_message)
+                        self._append_to_chat_history(assistant_message)
                         
                         # Execute tool calls and add results to chat history
                         for tool_call in tool_calls_data:
@@ -2433,7 +2633,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         tool_call_id=tool_call.get('id')
                                     )
                                     # Add tool result to chat history
-                                    self.chat_history.append({
+                                    self._append_to_chat_history({
                                         "role": "tool",
                                         "tool_call_id": tool_call['id'],
                                         "content": str(tool_result)
@@ -2441,7 +2641,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except Exception as tool_error:
                                     logging.error(f"Tool execution error in streaming: {tool_error}")
                                     # Add error result to chat history
-                                    self.chat_history.append({
+                                    self._append_to_chat_history({
                                         "role": "tool", 
                                         "tool_call_id": tool_call['id'],
                                         "content": f"Error: {str(tool_error)}"
@@ -2449,11 +2649,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     else:
                         # Add complete response to chat history (text-only response)
                         if response_text:
-                            self.chat_history.append({"role": "assistant", "content": response_text})
+                            self._append_to_chat_history({"role": "assistant", "content": response_text})
                         
                 except Exception as e:
                     # Rollback chat history on error
-                    self.chat_history = self.chat_history[:chat_history_length]
+                    self._truncate_chat_history(chat_history_length)
                     logging.error(f"OpenAI streaming error: {e}")
                     # Fall back to simulated streaming
                     response = self.chat(prompt, **kwargs)
